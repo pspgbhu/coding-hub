@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { SearchAddon } from '@xterm/addon-search'
+import { SearchAddon, type ISearchOptions } from '@xterm/addon-search'
 import {
   ArrowDown,
   ArrowUp,
@@ -50,6 +50,22 @@ interface SessionProps {
   onExit: (id: string, code: number) => void
   onError: (error: unknown) => void
   onSearch: () => void
+  onSearchResults: (id: string, count: number) => void
+}
+function searchOptions(theme: string, incremental = false): ISearchOptions {
+  const dark = theme === 'dark'
+  return {
+    incremental,
+    // Decorations enable the addon's bounded, debounced refresh on resize and parsed output.
+    decorations: {
+      matchBackground: dark ? '#303030' : '#e5e5e5',
+      matchBorder: '#737373',
+      matchOverviewRuler: '#737373',
+      activeMatchBackground: dark ? '#525252' : '#d4d4d4',
+      activeMatchBorder: dark ? '#d4d4d4' : '#525252',
+      activeMatchColorOverviewRuler: dark ? '#d4d4d4' : '#525252',
+    },
+  }
 }
 function terminalTheme() {
   const styles = getComputedStyle(document.documentElement)
@@ -74,6 +90,8 @@ function TerminalSession(props: SessionProps) {
     let exited = props.descriptor.exitCode !== undefined
     const buffered: TerminalOutput[] = []
     const terminal = new Terminal({
+      // The pinned search addon's official decorations use registerDecoration.
+      allowProposedApi: true,
       cursorBlink: true,
       fontFamily: '"SFMono-Regular", Consolas, "Liberation Mono", monospace',
       fontSize: props.settings?.fontSize ?? 12,
@@ -118,6 +136,9 @@ function TerminalSession(props: SessionProps) {
     const unsubscribe = subscribeOutput(props.descriptor.id, output)
     const input = terminal.onData((data) => {
       if (attached && !exited) void api.terminalWrite(props.descriptor.id, data).catch(report)
+    })
+    const results = search.onDidChangeResults(({ resultCount }) => {
+      if (!disposed) latest.current.onSearchResults(props.descriptor.id, resultCount)
     })
     terminal.attachCustomKeyEventHandler((event) => {
       if (
@@ -175,6 +196,7 @@ function TerminalSession(props: SessionProps) {
       unsubscribe()
       observer.disconnect()
       input.dispose()
+      results.dispose()
       latest.current.onReady(props.descriptor.id)
       terminal.dispose()
       handle.current = null
@@ -343,10 +365,16 @@ export default function TerminalPanel({
       return
     }
     const found = previous
-      ? handle.search.findPrevious(value)
-      : handle.search.findNext(value, { incremental })
+      ? handle.search.findPrevious(value, searchOptions(theme, incremental))
+      : handle.search.findNext(value, searchOptions(theme, incremental))
     setSearchResult(found ? '' : '未找到')
   }
+  useEffect(() => {
+    // Each terminal owns its addon/cache. Only the visible tab keeps the shared search active.
+    for (const handle of handles.current.values()) handle.search.clearDecorations()
+    if (searching && query) find(false, query, true)
+    else setSearchResult('')
+  }, [active, searching, query, theme])
   const copy = async () => {
     const handle = handles.current.get(active)
     if (!handle) return
@@ -507,7 +535,6 @@ export default function TerminalPanel({
             value={query}
             onChange={(event) => {
               setQuery(event.target.value)
-              find(false, event.target.value, true)
             }}
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
@@ -554,6 +581,9 @@ export default function TerminalPanel({
           settings={settings}
           onError={report}
           onSearch={() => setSearching(true)}
+          onSearchResults={(id, count) => {
+            if (id === active && searching && query) setSearchResult(count ? '' : '未找到')
+          }}
           onExit={(id, code) =>
             setTabs((entries) =>
               entries.map((item) =>
