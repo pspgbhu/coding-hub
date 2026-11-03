@@ -1,0 +1,37 @@
+name: 能力建议
+description: 描述个人开发工作流中尚未闭环的能力。
+title: '[Feature] '
+body:
+  - type: markdown
+    attributes:
+      value: 请描述实际任务与期望结果，使用不含机密的示例。此表单不会自动提交或上传数据。
+  - type: textarea
+    id: workflow
+    attributes:
+      label: 你正在完成什么工作
+      description: 包括当前入口、涉及的 Agent / 工作区，以及在哪一步受阻。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 希望得到的行为与完成标准
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: 当前替代方法与影响
+      description: 说明频率、时间成本或数据风险，方便确定优先级。
+  - type: dropdown
+    id: area
+    attributes:
+      label: 主要环节
+      options:
+        - Agent 连接与权限
+        - 项目与工作区
+        - 输入、会话与搜索
+        - 编辑、审阅与检查
+        - Git 交付
+        - 终端、键盘与布局
+        - 数据、恢复与发行

@@ -1,11 +1,12 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
-import { join, basename } from 'node:path'
-import { realpath } from 'node:fs/promises'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { z } from 'zod'
+import { rename } from 'node:fs/promises'
 import { Store } from './store'
 import { RuntimeClient } from './runtime-client'
-import type { AgentEvent, Settings, TerminalOutput } from '../shared/types'
+import { ApplicationServices } from './application'
+import { listDatabaseBackups, verifiedBackupPath, replaceDatabase } from './storage'
+import { redactDiagnostics } from '../shared/diagnostics'
 
 if (process.env.CODING_HUB_USER_DATA) app.setPath('userData', process.env.CODING_HUB_USER_DATA)
 const locked = app.requestSingleInstanceLock()
@@ -13,356 +14,121 @@ if (!locked) app.quit()
 let window: BrowserWindow | undefined
 let tray: Tray | undefined
 let store: Store
+let services: ApplicationServices | undefined
 let quitting = false
 let finalQuit = false
 const runtime = new RuntimeClient()
-const terminals = new Map<string, string>()
-const projectMutations = new Set<string>()
-const idSchema = z.string().uuid()
-const textSchema = z.string().min(1).max(100000)
-const providerSchema = z.enum(['claude', 'codex', 'opencode'])
-const settingsSchema = z.object({
-  theme: z.enum(['system', 'dark', 'light']),
-  cliPaths: z.object({
-    claude: z.string().max(4096).optional(),
-    codex: z.string().max(4096).optional(),
-    opencode: z.string().max(4096).optional(),
-  }),
-  lastProjectId: z.string().optional(),
-  lastSessionId: z.string().optional(),
-})
-const broadcast = (channel: string, value?: unknown): void => {
-  if (window && !window.isDestroyed()) window.webContents.send(channel, value)
-}
-const changed = (): void => broadcast('hub:sessions')
-function eventReceived(event: AgentEvent): void {
+let closeRequest: { nonce: string; resolve: () => void; reject: (error: Error) => void } | undefined
+async function prepareRendererClose(): Promise<void> {
+  if (!window || window.isDestroyed()) return
+  let timeout: NodeJS.Timeout | undefined
   try {
-    store.append(event)
-    broadcast('hub:event', event)
-    if (['done', 'error', 'status', 'session', 'user'].includes(event.kind)) changed()
-  } catch (error) {
-    console.error(
-      'Unable to persist runtime event:',
-      error instanceof Error ? error.message : 'Unknown error',
-    )
-  }
-}
-runtime.on('event', eventReceived)
-runtime.on('terminal', (output: TerminalOutput) => {
-  broadcast('hub:terminal', output)
-  if (output.exitCode !== undefined) terminals.delete(output.id)
-})
-runtime.on('exit', () => {
-  if (!store || quitting) return
-  for (const session of store.sessions()) {
-    if (session.status === 'running' || session.status === 'waiting') {
-      store.resolveRequests(session.id)
-      const turnId =
-        session.activeTurnId ?? store.view(session.id).events.at(-1)?.turnId ?? randomUUID()
-      eventReceived({
-        id: randomUUID(),
-        sessionId: session.id,
-        turnId,
-        timestamp: Date.now(),
-        kind: 'error',
-        text: '后台服务意外退出。本轮已中断，可以重新发送消息以恢复原会话。',
-      })
-      eventReceived({
-        id: randomUUID(),
-        sessionId: session.id,
-        turnId,
-        timestamp: Date.now(),
-        kind: 'done',
-        status: 'interrupted',
-      })
-    }
-  }
-  terminals.clear()
-  changed()
-})
-function projectRoot(id: unknown): string {
-  return store.project(idSchema.parse(id)).path
-}
-function assertTerminal(id: unknown): string {
-  const parsed = z.string().min(1).max(200).parse(id)
-  if (!terminals.has(parsed)) throw new Error('终端已关闭，请重新打开。')
-  return parsed
-}
-function assertNoRunning(projectId: string): void {
-  if (
-    store
-      .sessions()
-      .some((s) => s.projectId === projectId && ['running', 'waiting'].includes(s.status))
-  )
-    throw new Error('请先停止此项目中正在运行的任务。')
-}
-function assertProjectAvailable(projectId: string): void {
-  if (projectMutations.has(projectId)) throw new Error('项目正在执行 Git 或移除操作，请稍后重试。')
-}
-async function mutateProject<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
-  assertProjectAvailable(projectId)
-  projectMutations.add(projectId)
-  try {
-    return await operation()
+    await new Promise<void>((resolve, reject) => {
+      const nonce = randomUUID()
+      closeRequest = { nonce, resolve, reject }
+      timeout = setTimeout(
+        () => reject(new Error('窗口未确认草稿与编辑内容已保存，已取消退出。')),
+        15000,
+      )
+      window!.webContents.send('hub:prepare-close', { nonce })
+    })
   } finally {
-    projectMutations.delete(projectId)
+    if (timeout) clearTimeout(timeout)
+    closeRequest = undefined
+  }
+}
+
+async function openStore(): Promise<Store | undefined> {
+  const location = join(app.getPath('userData'), 'coding-hub.db')
+  while (true) {
+    try {
+      return new Store(location, (error) => services?.reportBackupFailure(error))
+    } catch (error) {
+      const backups = listDatabaseBackups(location)
+      const result = await dialog.showMessageBox({
+        type: 'error',
+        title: '本地数据需要恢复',
+        message: '无法打开 Coding Hub 数据',
+        detail: redactDiagnostics(String(error)),
+        buttons: [...(backups.length ? ['从最近的有效备份恢复'] : []), '打开数据目录', '退出'],
+        defaultId: backups.length ? 0 : 1,
+        cancelId: backups.length ? 2 : 1,
+      })
+      if (backups.length && result.response === 0) {
+        for (const backup of backups) {
+          const moved: { original: string; preserved: string }[] = []
+          let replacement: ReturnType<typeof replaceDatabase> | undefined
+          try {
+            const source = verifiedBackupPath(location, backup.id)
+            const suffix = `.damaged-${Date.now()}-${randomUUID()}`
+            for (const original of [
+              location,
+              location + '-wal',
+              location + '-shm',
+              join(app.getPath('userData'), 'outputs'),
+            ]) {
+              const preserved = original + suffix
+              try {
+                await rename(original, preserved)
+                moved.push({ original, preserved })
+              } catch (e) {
+                if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+              }
+            }
+            replacement = replaceDatabase(location, source)
+            const restored = new Store(location, (failure) =>
+              services?.reportBackupFailure(failure),
+            )
+            replacement.commit()
+            return restored
+          } catch {
+            try {
+              replacement?.rollback()
+              for (const entry of moved.reverse()) await rename(entry.preserved, entry.original)
+            } catch (rollbackError) {
+              await dialog.showMessageBox({
+                type: 'error',
+                message: '恢复尚未完成，原资料已保存在 damaged / rollback 文件中。',
+                detail: redactDiagnostics(String(rollbackError)),
+              })
+              return undefined
+            }
+          }
+        }
+        await dialog.showMessageBox({
+          type: 'error',
+          message: '没有可恢复的有效备份。原数据已保留，请打开数据目录检查。',
+        })
+      } else if (result.response === (backups.length ? 1 : 0)) {
+        await shell.openPath(app.getPath('userData'))
+        continue
+      }
+      return undefined
+    }
   }
 }
 function registerIPC(): void {
-  const handlers: Record<string, (...args: any[]) => any> = {
-    bootstrap: () => ({
-      projects: store.projects(),
-      sessions: store.sessions(),
-      settings: store.settings(),
-      version: app.getVersion(),
-      platform: process.platform,
-    }),
-    addProject: async () => {
-      const result = await dialog.showOpenDialog(window!, {
-        title: '打开项目',
-        properties: ['openDirectory', 'createDirectory'],
-      })
-      if (result.canceled || !result.filePaths[0]) return null
-      const path = await realpath(result.filePaths[0])
-      const project = store.addProject(path, basename(path))
-      store.saveSettings({ ...store.settings(), lastProjectId: project.id })
-      changed()
-      return project
-    },
-    removeProject: async (id: string) => {
-      idSchema.parse(id)
-      assertNoRunning(id)
-      await mutateProject(id, async () => {
-        for (const [terminalId, owner] of terminals)
-          if (owner === id) {
-            await runtime.call('terminal.close', terminalId)
-            terminals.delete(terminalId)
-          }
-        store.removeProject(id)
-        changed()
-      })
-    },
-    createSession: (input: unknown) => {
-      const parsed = z
-        .object({
-          projectId: idSchema,
-          provider: providerSchema,
-          model: z.string().max(300).optional(),
-        })
-        .parse(input)
-      assertProjectAvailable(parsed.projectId)
-      const session = store.createSession(parsed.projectId, parsed.provider, parsed.model)
-      store.saveSettings({
-        ...store.settings(),
-        lastProjectId: parsed.projectId,
-        lastSessionId: session.id,
-      })
-      changed()
-      return session
-    },
-    getSession: (id: unknown) => store.view(idSchema.parse(id)),
-    searchSessions: (query: unknown) => store.searchSessions(z.string().max(300).parse(query)),
-    updateSession: (id: unknown, patch: unknown) => {
-      const parsed = z
-        .object({
-          title: z.string().trim().min(1).max(200).optional(),
-          archived: z.boolean().optional(),
-          model: z.string().max(300).optional(),
-        })
-        .parse(patch)
-      const sessionId = idSchema.parse(id)
-      const session = store.session(sessionId)
-      if (
-        ['running', 'waiting'].includes(session.status) &&
-        (parsed.archived || parsed.model !== undefined)
-      )
-        throw new Error('请先停止任务再归档或修改模型。')
-      const updated = store.patchSession(sessionId, parsed)
-      changed()
-      return updated
-    },
-    sendMessage: async (id: unknown, text: unknown) => {
-      const session = store.session(idSchema.parse(id))
-      assertProjectAvailable(session.projectId)
-      const content = textSchema.parse(text).trim()
-      if (!content) throw new Error('请输入消息。')
-      if (['running', 'waiting'].includes(session.status))
-        throw new Error('当前会话正在执行任务，请等待完成或先停止。')
-      const project = store.project(session.projectId)
-      const turnId = randomUUID()
-      store.patchSession(session.id, { status: 'running' })
-      eventReceived({
-        id: randomUUID(),
-        sessionId: session.id,
-        turnId,
-        kind: 'user',
-        text: content,
-        timestamp: Date.now(),
-      })
-      changed()
-      try {
-        await runtime.call(
-          'agent.send',
-          { session, cwd: project.path, cliPath: store.settings().cliPaths[session.provider] },
-          content,
-          turnId,
-        )
-      } catch (error) {
-        eventReceived({
-          id: randomUUID(),
-          sessionId: session.id,
-          turnId,
-          kind: 'error',
-          text: error instanceof Error ? error.message : String(error),
-          timestamp: Date.now(),
-        })
-        throw error
-      }
-    },
-    interrupt: async (id: unknown) => {
-      const sessionId = idSchema.parse(id)
-      const turnId = store.session(sessionId).activeTurnId
-      await runtime.call('agent.interrupt', sessionId)
-      if (store.session(sessionId).activeTurnId === turnId) {
-        store.resolveRequests(sessionId, undefined, turnId)
-        if (['running', 'waiting'].includes(store.session(sessionId).status))
-          store.patchSession(sessionId, { status: 'interrupted' })
-      }
-      changed()
-    },
-    respond: async (id: unknown, requestId: unknown, response: unknown) => {
-      const sessionId = idSchema.parse(id)
-      const req = z.string().min(1).max(1000).parse(requestId)
-      const answer = z
-        .object({
-          decision: z.string().max(100).optional(),
-          answers: z.record(z.string(), z.array(z.string().max(10000))).optional(),
-        })
-        .parse(response)
-      if (
-        !store
-          .view(sessionId)
-          .events.some(
-            (e) =>
-              e.requestId === req &&
-              ['approval', 'question'].includes(e.kind) &&
-              e.state !== 'completed',
-          )
-      )
-        throw new Error('此请求已过期。')
-      await runtime.call('agent.respond', sessionId, req, answer)
-      store.resolveRequests(sessionId, req)
-      if (
-        store.session(sessionId).status === 'waiting' &&
-        !store
-          .view(sessionId)
-          .events.some(
-            (event) => ['approval', 'question'].includes(event.kind) && event.state !== 'completed',
-          )
-      )
-        store.patchSession(sessionId, { status: 'running' })
-      changed()
-    },
-    providers: (projectId?: string) =>
-      runtime.call('agent.probe', store.settings(), projectId ? projectRoot(projectId) : undefined),
-    getSettings: () => store.settings(),
-    saveSettings: (input: unknown) => store.saveSettings(settingsSchema.parse(input) as Settings),
-    listFiles: (projectId: unknown, path = '') =>
-      runtime.call('workspace.listFiles', projectRoot(projectId), z.string().max(4096).parse(path)),
-    readFile: (projectId: unknown, path: unknown) =>
-      runtime.call(
-        'workspace.readFile',
-        projectRoot(projectId),
-        z.string().min(1).max(4096).parse(path),
-      ),
-    saveFile: (
-      projectId: unknown,
-      path: unknown,
-      content: unknown,
-      fingerprint: unknown,
-      overwrite = false,
-    ) =>
-      runtime.call(
-        'workspace.saveFile',
-        projectRoot(projectId),
-        z.string().min(1).max(4096).parse(path),
-        z
-          .string()
-          .max(4 * 1024 * 1024)
-          .parse(content),
-        z.string().max(100).parse(fingerprint),
-        z.boolean().parse(overwrite),
-      ),
-    gitStatus: (projectId: unknown) => runtime.call('workspace.gitStatus', projectRoot(projectId)),
-    gitDiff: (projectId: unknown, path: unknown, staged = false) =>
-      runtime.call(
-        'workspace.gitDiff',
-        projectRoot(projectId),
-        z.string().min(1).max(4096).parse(path),
-        z.boolean().parse(staged),
-      ),
-    gitAction: (projectId: unknown, action: unknown, value: unknown) => {
-      const id = idSchema.parse(projectId)
-      const operation = z.enum(['stage', 'unstage', 'commit', 'checkout']).parse(action)
-      if (operation === 'commit' || operation === 'checkout') assertNoRunning(id)
-      const argument = z.string().min(1).max(10000).parse(value)
-      return mutateProject(id, () =>
-        runtime.call('workspace.gitAction', projectRoot(id), operation, argument),
-      )
-    },
-    terminalCreate: async (projectId: unknown, cols: unknown, rows: unknown) => {
-      const id = idSchema.parse(projectId)
-      const terminalId: string = await runtime.call(
-        'terminal.create',
-        projectRoot(id),
-        z.number().int().min(10).max(500).parse(cols),
-        z.number().int().min(2).max(300).parse(rows),
-      )
-      terminals.set(terminalId, id)
-      return terminalId
-    },
-    terminalWrite: (id: unknown, data: unknown) =>
-      runtime.call('terminal.write', assertTerminal(id), z.string().max(1000000).parse(data)),
-    terminalResize: (id: unknown, cols: unknown, rows: unknown) =>
-      runtime.call(
-        'terminal.resize',
-        assertTerminal(id),
-        z.number().int().min(1).max(500).parse(cols),
-        z.number().int().min(1).max(300).parse(rows),
-      ),
-    terminalAck: (id: unknown, bytes: unknown) =>
-      terminals.has(String(id))
-        ? runtime.call(
-            'terminal.ack',
-            assertTerminal(id),
-            z.number().int().min(0).max(1000000).parse(bytes),
-          )
-        : undefined,
-    terminalClose: async (id: unknown) => {
-      const terminalId = assertTerminal(id)
-      await runtime.call('terminal.close', terminalId)
-      terminals.delete(terminalId)
-    },
-    openExternal: async (url: unknown) => {
-      const parsed = new URL(z.string().max(10000).parse(url))
-      if (!['http:', 'https:'].includes(parsed.protocol))
-        throw new Error('仅支持打开 HTTP/HTTPS 链接。')
-      await shell.openExternal(parsed.toString())
-    },
-    revealProject: async (id: unknown) => {
-      const error = await shell.openPath(projectRoot(id))
-      if (error) throw new Error(error)
-    },
-    windowAction: (action: unknown) => {
-      if (!window) return
-      const parsed = z.enum(['minimize', 'maximize', 'close']).parse(action)
-      if (parsed === 'minimize') window.minimize()
-      else if (parsed === 'maximize') window.isMaximized() ? window.unmaximize() : window.maximize()
-      else window.close()
-    },
-  }
-  for (const [name, handler] of Object.entries(handlers))
-    ipcMain.handle(`hub:${name}`, (event, ...args) => {
+  ipcMain.on('hub:close-ready', (event, result: unknown) => {
+    if (
+      !window ||
+      event.sender !== window.webContents ||
+      event.senderFrame !== window.webContents.mainFrame ||
+      !closeRequest
+    )
+      return
+    if (
+      !result ||
+      typeof result !== 'object' ||
+      !('nonce' in result) ||
+      result.nonce !== closeRequest.nonce
+    )
+      return
+    if ('error' in result && typeof result.error === 'string')
+      closeRequest.reject(new Error(redactDiagnostics(result.error).slice(0, 2000)))
+    else closeRequest.resolve()
+  })
+  for (const [name, handler] of Object.entries(services!.handlers))
+    ipcMain.handle(`hub:${name}`, async (event, ...args) => {
       if (
         !window ||
         event.sender !== window.webContents ||
@@ -407,6 +173,22 @@ function createWindow(): void {
   window.on('closed', () => {
     window = undefined
   })
+  window.webContents.on('render-process-gone', () => {
+    if (!quitting) window?.reload()
+  })
+  window.on('unresponsive', () => {
+    void dialog
+      .showMessageBox(window!, {
+        type: 'warning',
+        message: '窗口暂时没有响应',
+        detail: '已保存的草稿和后台任务保留。可以继续等待，或重新加载窗口。',
+        buttons: ['继续等待', '重新加载'],
+        defaultId: 0,
+      })
+      .then((result) => {
+        if (result.response === 1) window?.reload()
+      })
+  })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', (event, url) => {
     if (url !== window?.webContents.getURL()) event.preventDefault()
@@ -432,9 +214,16 @@ function setupTray(): void {
   tray.on('click', createWindow)
 }
 if (locked)
-  void app.whenReady().then(() => {
+  void app.whenReady().then(async () => {
     app.setAppUserModelId('dev.codinghub.desktop')
-    store = new Store(join(app.getPath('userData'), 'coding-hub.db'))
+    const opened = await openStore()
+    if (!opened) {
+      finalQuit = true
+      app.quit()
+      return
+    }
+    store = opened
+    services = new ApplicationServices(runtime, store, () => window)
     registerIPC()
     createWindow()
     setupTray()
@@ -485,7 +274,9 @@ if (locked)
         },
       ]),
     )
-    void runtime.start().catch((error) => console.error('Runtime startup:', error.message))
+    void services
+      .ready()
+      .catch((error) => console.error('Runtime startup:', redactDiagnostics(String(error))))
   })
 app.on('second-instance', createWindow)
 app.on('activate', createWindow)
@@ -495,10 +286,31 @@ app.on('before-quit', (event) => {
   event.preventDefault()
   if (quitting) return
   quitting = true
-  void runtime.close().finally(() => {
-    store?.close()
-    tray?.destroy()
-    finalQuit = true
-    app.quit()
-  })
+  void Promise.resolve()
+    .then(async () => {
+      services?.beginClose()
+      await prepareRendererClose()
+      await (services?.close() ?? runtime.close())
+    })
+    .then(() => {
+      store?.close()
+      tray?.destroy()
+      finalQuit = true
+      app.quit()
+    })
+    .catch((error) => {
+      quitting = false
+      services?.cancelClose()
+      if (window && !window.isDestroyed()) window.webContents.send('hub:close-cancelled')
+      createWindow()
+      console.error('Shutdown:', redactDiagnostics(String(error)))
+      void dialog.showMessageBox(window!, {
+        type: 'error',
+        title: '暂时无法退出',
+        message: '尚未确认内容保存或后台停止，已取消退出。',
+        detail:
+          redactDiagnostics(String(error)).slice(0, 2000) +
+          '\n请检查保存状态和后台任务后，再次退出。',
+      })
+    })
 })

@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
-import { StringDecoder } from 'node:string_decoder'
+import { RedactingDiagnosticStream } from '../../shared/diagnostics'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import type { AgentContext, EmitEvent } from '../../shared/runtime'
 import type { Model } from '../../shared/types'
-import { launch, resolveCommand, terminateProcessTree } from '../process'
-import { Turn, approved, errorMessage, type Reply } from './common'
+import { finalizeOwnedChild, launch, resolveCommand, terminateProcessTree } from '../process'
+import { Turn, approved, errorMessage, inputImages, type Reply } from './common'
 
 type Json = Record<string, any>
 interface Server {
@@ -90,7 +90,12 @@ export class OpenCodeAdapter {
     }
     this.active.set(context.session.id, state)
     state.turn.status('running')
-    void this.start(state, text).catch((error) => this.end(state, error))
+    void this.start(state, text).catch(async (error) => {
+      if (state.submitted && state.nativeId && !state.turn.ended) {
+        state.turn.event({ kind: 'error', text: errorMessage(error) })
+        await this.interrupt(context.session.id).catch(() => {})
+      } else this.end(state, error)
+    })
   }
   private async request(
     server: Server,
@@ -183,18 +188,29 @@ export class OpenCodeAdapter {
       closed: false,
       stderr: '',
     }
-    const decoder = new StringDecoder('utf8')
+    const diagnostics = new RedactingDiagnosticStream((text) => {
+      server.stderr = (server.stderr + text).slice(-4000)
+    })
     child.stdout.on('data', () => {})
     child.stdin.on('error', () => {})
-    child.stderr.on('data', (chunk: Buffer) => {
-      server.stderr = (server.stderr + decoder.write(chunk)).slice(-4000)
-    })
+    child.stderr.on('data', (chunk: Buffer) => diagnostics.push(chunk))
+    child.stderr.once('end', () => diagnostics.end())
     let spawnError: Error | undefined
     child.once('error', (error) => {
       spawnError = error
       this.serverFailed(server, error)
     })
-    child.once('close', (code, signal) => {
+    child.once('close', async (code, signal) => {
+      if (server.closed) return
+      try {
+        await finalizeOwnedChild(child)
+      } catch (error) {
+        server.closed = true
+        server.stream?.abort()
+        for (const state of this.active.values())
+          if (state.server === server) state.turn.failStop(error)
+        return
+      }
       if (!server.closed)
         this.serverFailed(
           server,
@@ -313,13 +329,8 @@ export class OpenCodeAdapter {
         if (!controller.signal.aborted)
           for (const state of this.active.values())
             if (state.server === server) {
-              if (state.nativeId)
-                void this.request(
-                  server,
-                  `/session/${encodeURIComponent(state.nativeId)}/abort`,
-                  'POST',
-                ).catch(() => {})
-              this.end(state, error)
+              state.turn.event({ kind: 'error', text: errorMessage(error) })
+              await this.interrupt(state.turn.context.session.id).catch(() => {})
             }
       } finally {
         if (server.stream === controller) server.connected = false
@@ -358,7 +369,15 @@ export class OpenCodeAdapter {
     }
     state.submitted = true
     await this.request(server, `/session/${encodeURIComponent(session.id)}/prompt_async`, 'POST', {
-      parts: [{ type: 'text', text }],
+      parts: [
+        { type: 'text', text },
+        ...inputImages(state.turn.context).map((image) => ({
+          type: 'file',
+          mime: image.mimeType,
+          filename: image.name,
+          url: image.dataUrl,
+        })),
+      ],
       ...(selectedModel ? { model: selectedModel } : {}),
     })
   }
@@ -417,7 +436,7 @@ export class OpenCodeAdapter {
       ['permission.replied', 'question.replied', 'question.rejected'].includes(event.type) &&
       state.turn.pending.has(p.requestID)
     )
-      state.turn.respond(p.requestID, { decision: 'deny' })
+      state.turn.resolveExternal(p.requestID)
   }
   private part(state: Active, part: Json): void {
     if (
@@ -472,7 +491,7 @@ export class OpenCodeAdapter {
     if (state.requests.has(request.id)) return
     state.requests.add(request.id)
     const question = type === 'question.asked'
-    const reply = await state.turn.ask(
+    await state.turn.ask(
       request.id,
       question
         ? {
@@ -491,25 +510,32 @@ export class OpenCodeAdapter {
             input: { patterns: request.patterns, metadata: request.metadata },
             decisions: ['once', 'always', 'reject'],
           },
+      async (reply) => {
+        if (!state.server || state.turn.ended || state.turn.interrupted)
+          throw new Error('This request is no longer active.')
+        const id = encodeURIComponent(request.id)
+        if (question) {
+          if (reply.answers)
+            await this.request(state.server, `/question/${id}/reply`, 'POST', {
+              answers: request.questions.map(
+                (_: unknown, index: number) => reply.answers?.[String(index)] ?? [],
+              ),
+            })
+          else await this.request(state.server, `/question/${id}/reject`, 'POST')
+        } else
+          await this.request(state.server, `/permission/${id}/reply`, 'POST', {
+            reply:
+              reply.decision === 'always' ? 'always' : approved(reply.decision) ? 'once' : 'reject',
+          })
+      },
     )
-    if (!state.server || state.turn.ended) return
-    const id = encodeURIComponent(request.id)
-    if (question) {
-      if (reply.answers)
-        await this.request(state.server, `/question/${id}/reply`, 'POST', {
-          answers: request.questions.map(
-            (_: unknown, index: number) => reply.answers?.[String(index)] ?? [],
-          ),
-        })
-      else await this.request(state.server, `/question/${id}/reject`, 'POST')
-    } else
-      await this.request(state.server, `/permission/${id}/reply`, 'POST', {
-        reply:
-          reply.decision === 'always' ? 'always' : approved(reply.decision) ? 'once' : 'reject',
-      })
   }
   private end(state: Active, error?: unknown): void {
     if (state.turn.ended) return
+    if (state.turn.interrupted && error && ['stopping', 'failed'].includes(state.turn.stopState)) {
+      state.turn.failStop(error)
+      return
+    }
     state.turn.finish(state.turn.interrupted ? 'interrupted' : error ? 'error' : 'idle', error)
     if (this.active.get(state.turn.context.session.id) === state)
       this.active.delete(state.turn.context.session.id)
@@ -531,19 +557,25 @@ export class OpenCodeAdapter {
   async interrupt(sessionId: string): Promise<void> {
     const state = this.active.get(sessionId)
     if (!state) return
-    state.turn.cancelPending()
-    if (state.server && state.nativeId)
-      await this.request(
-        state.server,
-        `/session/${encodeURIComponent(state.nativeId)}/abort`,
-        'POST',
-      ).catch(() => {})
-    this.end(state)
+    state.turn.beginStop()
+    try {
+      if (state.server && state.nativeId)
+        await this.request(
+          state.server,
+          `/session/${encodeURIComponent(state.nativeId)}/abort`,
+          'POST',
+        )
+      this.end(state)
+    } catch (error) {
+      if (state.turn.ended) return
+      state.turn.failStop(error)
+      throw error
+    }
   }
   async respond(sessionId: string, requestId: string, reply: Reply): Promise<void> {
     const state = this.active.get(sessionId)
     if (!state) throw new Error('This session is no longer running.')
-    state.turn.respond(requestId, reply)
+    await state.turn.respond(requestId, reply)
   }
   async models(path: string, cwd = process.cwd()): Promise<Model[]> {
     if (this.closed) throw new Error('Agent runtime is closing.')

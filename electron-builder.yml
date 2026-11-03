@@ -1,5 +1,7 @@
 appId: dev.codinghub.desktop
 productName: Coding Hub
+extraMetadata:
+  releaseChannel: internal
 directories:
   output: release
   buildResources: build
