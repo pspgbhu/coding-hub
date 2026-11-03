@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -191,6 +192,84 @@ describe('safe editor writes and CRUD', () => {
 })
 
 describe('canonical repositories and bounded search', () => {
+  it('suppresses hooks only for automatic worktree creation without changing Git configuration', async () => {
+    await repository()
+    await fs.writeFile(path.join(root, 'file.txt'), 'baseline')
+    await commit()
+    const hooks = path.join(directory, 'configured hooks')
+    await fs.mkdir(hooks)
+    for (const event of ['post-checkout', 'pre-commit']) {
+      const filename = path.join(hooks, event)
+      await fs.writeFile(filename, `#!/bin/sh\nprintf '%s\\n' '${event}' >> .${event}-marker\n`)
+      await fs.chmod(filename, 0o755)
+    }
+    // Override the fixture's empty hooks path with real executable repository hooks.
+    await gitAt(root, 'config', 'core.hooksPath', hooks)
+    const localConfiguration = await fs.readFile(path.join(root, '.git', 'config'))
+    const globalConfiguration = async () => {
+      const executable = await resolveCommand('git')
+      if (!executable) throw new Error('Git is required for workspace tests')
+      const result = await runCommand(executable, ['config', '--global', '--null', '--list'], root)
+      return {
+        code: result.code,
+        // Never include the user's global configuration values in assertion output.
+        digest: createHash('sha256')
+          .update(result.stdoutBuffer)
+          .update(result.stderr)
+          .digest('hex'),
+      }
+    }
+    const globalBefore = await globalConfiguration()
+    const original = await service.inspect(root)
+    const head = await gitAt(root, 'rev-parse', 'HEAD')
+
+    // Prove this native Git actually executes the configured hook before testing suppression.
+    await gitAt(root, 'checkout', 'main')
+    expect(await fs.readFile(path.join(root, '.post-checkout-marker'), 'utf8')).toBe(
+      'post-checkout\n',
+    )
+    await fs.rm(path.join(root, '.post-checkout-marker'))
+
+    const isolated = await service.createWorktree(
+      root,
+      path.join(directory, 'isolated'),
+      'task/no-automatic-hooks',
+    )
+    await expect(
+      fs.stat(path.join(isolated.rootPath, '.post-checkout-marker')),
+    ).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    expect(await fs.readFile(path.join(isolated.rootPath, 'file.txt'), 'utf8')).toBe('baseline')
+    expect(isolated).toMatchObject({
+      branch: 'task/no-automatic-hooks',
+      repositoryId: original.repositoryId,
+      hasHead: true,
+    })
+    expect(isolated.canonicalId).not.toBe(original.canonicalId)
+    expect(isolated.gitDir).not.toBe(original.gitDir)
+    expect(await gitAt(isolated.rootPath, 'rev-parse', 'HEAD')).toBe(head)
+    expect(await service.listWorktrees(root)).toHaveLength(2)
+    expect(await fs.readFile(path.join(root, '.git', 'config'))).toEqual(localConfiguration)
+    expect(await globalConfiguration()).toEqual(globalBefore)
+
+    // Explicit user Git actions must continue to run the same repository hooks.
+    await service.gitAction(isolated.rootPath, 'checkout', 'task/no-automatic-hooks')
+    expect(await fs.readFile(path.join(isolated.rootPath, '.post-checkout-marker'), 'utf8')).toBe(
+      'post-checkout\n',
+    )
+    await fs.writeFile(path.join(isolated.rootPath, 'file.txt'), 'user change')
+    await service.gitAction(isolated.rootPath, 'stage', 'file.txt')
+    await service.gitAction(isolated.rootPath, 'commit', 'test: explicit commit runs hooks')
+    expect(await fs.readFile(path.join(isolated.rootPath, '.pre-commit-marker'), 'utf8')).toBe(
+      'pre-commit\n',
+    )
+    expect(await gitAt(root, 'rev-parse', 'HEAD')).toBe(head)
+    expect(await gitAt(isolated.rootPath, 'rev-parse', 'HEAD^')).toBe(head)
+    expect(await fs.readFile(path.join(root, '.git', 'config'))).toEqual(localConfiguration)
+    expect(await globalConfiguration()).toEqual(globalBefore)
+  })
+
   it('shares a repository identity for a subproject and worktree while preserving distinct cwd identities', async () => {
     await repository()
     await fs.mkdir(path.join(root, 'nested'))

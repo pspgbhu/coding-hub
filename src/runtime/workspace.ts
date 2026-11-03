@@ -925,6 +925,9 @@ export class WorkspaceService {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
     await this.requireGit(identity.repositoryRoot, [
+      // Automatic isolation must not execute repository hooks. Keep explicit Git actions unchanged.
+      '-c',
+      `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`,
       'worktree',
       'add',
       '-b',
