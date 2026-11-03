@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { BrowserWindow } from 'electron'
-import type { TaskRun, SessionView } from '../src/shared/types'
+import type { TaskRun, SessionView, BackupInfo } from '../src/shared/types'
 import type { RuntimeClient } from '../src/main/runtime-client'
 import { Store } from '../src/main/store'
 import { ApplicationServices } from '../src/main/application'
@@ -82,7 +82,12 @@ function setup() {
   return project
 }
 function ownProcess() {
-  const process = { id: randomUUID(), pid: 12345, started: 'fixture-birth', isolatedGroup: true }
+  const process = {
+    id: randomUUID(),
+    pid: 12345,
+    started: 'Tue Nov 3 10:00:00 2026',
+    isolatedGroup: true,
+  }
   runtime.emit('ownership', { action: 'register', process })
   return process
 }
@@ -252,6 +257,88 @@ describe('verification task recovery after runtime loss', () => {
       finishedAt: expect.any(Number),
     })
     expect(runtime.calls.some((entry) => entry.method === 'task.run')).toBe(false)
+  })
+})
+
+describe('running task snapshots restored from backups', () => {
+  it('refuses active execution, then archives the old task state without stopping healthy idle CLI servers or resending work', async () => {
+    const project = setup()
+    await services.ready()
+    const run = await startTask(project.id)
+    const owned = ownProcess()
+    const backup = services.handlers.createBackup() as BackupInfo
+    await expect(services.handlers.restoreBackup(backup.id)).rejects.toThrow('WORKSPACE_BUSY')
+    expect(storedTask(run.id).status).toBe('running')
+    expect(fixture.cleanup).not.toHaveBeenCalled()
+    expect(runtime.calls.some((entry) => entry.method === 'task.cancel')).toBe(false)
+
+    runtime.emit('task', {
+      ...run,
+      status: 'passed',
+      finishedAt: Date.now(),
+      output: 'CURRENT_CHECK_COMPLETED',
+    })
+    runtime.emit('ownership', { action: 'release', process: owned })
+    ownProcess() // A healthy idle CLI server is distinct from active verification execution.
+    await services.handlers.restoreBackup(backup.id)
+    const restored = storedTask(run.id)
+    expect(restored.status).toBe('cancelled')
+    expect(restored.finishedAt).toBeGreaterThanOrEqual(run.startedAt)
+    expect(restored.output).toContain('partial check output')
+    expect(restored.output).toContain('备份中的运行状态已中断，未自动重发')
+    expect(restored.output).not.toContain('后台服务已退出')
+    expect(listTasks(project.id)[0]).toEqual(restored)
+    expect(fixture.cleanup).not.toHaveBeenCalled()
+    expect(runtime.calls.some((entry) => entry.method === 'task.cancel')).toBe(false)
+    expect(runtime.calls.filter((entry) => entry.method === 'task.run')).toHaveLength(1)
+    await expect(startTask(project.id)).resolves.toMatchObject({ status: 'running' })
+  })
+
+  it('rotates the data generation immediately after replacement and retries every restored task after a write failure', async () => {
+    const project = setup()
+    const secondProject = store.addProject(join(directory, 'second'), 'second')
+    store.patchProject(secondProject.id, { trusted: true })
+    const session = store.createSession(project.id, 'codex')
+    store.saveDraft(session.id, { text: 'BACKUP_DRAFT', context: [], updatedAt: 1 })
+    const runs = [await startTask(project.id), await startTask(secondProject.id)]
+    const backup = services.handlers.createBackup() as BackupInfo
+    for (const run of runs)
+      runtime.emit('task', { ...run, status: 'passed', finishedAt: Date.now() })
+    store.saveDraft(session.id, { text: 'CURRENT_DRAFT', context: [], updatedAt: 2 })
+    const oldGeneration = (services.handlers.bootstrap() as { dataGeneration: string })
+      .dataGeneration
+    failOneTaskWrite('cancelled')
+    const failure = await Promise.resolve(services.handlers.restoreBackup(backup.id)).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toContain('[DATA_RESTORE_APPLIED]')
+    expect((failure as Error).message).not.toContain('SQLITE_FULL')
+    expect((services.handlers.bootstrap() as { dataGeneration: string }).dataGeneration).not.toBe(
+      oldGeneration,
+    )
+    expect(() =>
+      services.handlers.saveDraft(
+        session.id,
+        { text: 'STALE_WRITE', context: [], updatedAt: 100 },
+        oldGeneration,
+      ),
+    ).toThrow('STALE_DATA_GENERATION')
+    expect(store.getDraft(session.id).text).toBe('BACKUP_DRAFT')
+    expect(services.healthState.storage).toBe('error')
+    expect(
+      (services.handlers.listTasks() as TaskRun[]).every((run) => run.status === 'cancelled'),
+    ).toBe(true)
+    await services.handlers.retryStorage()
+    for (const run of runs) {
+      expect(storedTask(run.id).status).toBe('cancelled')
+      expect(storedTask(run.id).output).toContain('备份中的运行状态已中断，未自动重发')
+      expect(storedTask(run.id).output).not.toContain('后台服务已退出')
+    }
+    expect(services.healthState.storage).toBe('ready')
+    expect(runtime.calls.filter((entry) => entry.method === 'task.run')).toHaveLength(2)
+    await expect(startTask(project.id)).resolves.toMatchObject({ status: 'running' })
   })
 })
 

@@ -100,6 +100,7 @@ export class ApplicationServices {
   private readonly reviewCompletions = new Set<Promise<void>>()
   private readonly terminals = new Map<string, string>()
   private readonly owned = new Map<string, ProcessOwnership>()
+  private ownershipReadError?: Error
   private readonly tasks = new Map<string, TaskRun>()
   private readonly recoveringTasks = new Set<string>()
   private pendingEvents: AgentEvent[] = []
@@ -131,24 +132,18 @@ export class ApplicationServices {
       },
     )
     mkdirSync(this.dataDir, { recursive: true, mode: 0o700 })
-    try {
-      for (const p of JSON.parse(
-        readFileSync(join(this.dataDir, 'owned-processes.json'), 'utf8'),
-      ) as ProcessOwnership[])
-        this.owned.set(p.id, p)
-    } catch {
-      /* First launch. */
-    }
     for (const task of this.taskRecords()) {
       if (task.status !== 'running') continue
       this.tasks.set(task.id, task)
       this.recoveringTasks.add(task.id)
     }
-    if (this.owned.size || this.recoveringTasks.size)
+    this.readOwnership(true)
+    if (!this.ownershipReadError && (this.owned.size || this.recoveringTasks.size))
       this.cleanup = this.cleanOwnedProcesses().then(() => this.reconcileRecoveredTasks())
     runtime.on('ownership', (event: ProcessOwnershipEvent) => {
       if (event.action === 'register') this.owned.set(event.process.id, event.process)
       else this.owned.delete(event.process.id)
+      if (this.ownershipReadError) return
       if (!this.persistOwnership() && event.action === 'register') {
         this.failStorage(new Error('受管进程恢复记录无法保存。'))
         this.cleanup = this.cleanOwnedProcesses()
@@ -188,7 +183,112 @@ export class ApplicationServices {
     if (generation !== undefined && generation !== this.dataGeneration)
       throw new Error('[STALE_DATA_GENERATION] 数据已恢复，旧窗口的延迟保存已忽略。')
   }
+  private assertOwnershipReadable(): void {
+    if (this.ownershipReadError) throw this.ownershipReadError
+  }
+  private readOwnership(allowFirstLaunch = false): void {
+    const file = join(this.dataDir, 'owned-processes.json')
+    try {
+      let raw: unknown
+      try {
+        raw = JSON.parse(readFileSync(file, 'utf8'))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        if (!allowFirstLaunch || this.owned.size || this.recoveringTasks.size)
+          throw new Error('Process ownership file is missing while execution may still exist.')
+        raw = []
+      }
+      // Birth identities are native ps lstart text (including localized day/month names),
+      // or the UTC DateTime ticks produced by Windows CIM. Never accept an arbitrary PID alone.
+      const birth = z
+        .string()
+        .max(256)
+        .refine((value) => {
+          if (/^\d{17,19}$/.test(value)) {
+            const ticks = BigInt(value)
+            return ticks >= 621355968000000000n && ticks <= 3155378975999999999n
+          }
+          const date = /^(\S+)\s+(\S+)\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/.exec(value)
+          return (
+            !!date &&
+            Number(date[3]) >= 1 &&
+            Number(date[3]) <= 31 &&
+            Number(date[4]) <= 23 &&
+            Number(date[5]) <= 59 &&
+            Number(date[6]) <= 59 &&
+            Number(date[7]) >= 1970 &&
+            !/[\u0000-\u001f\u007f]/.test(value)
+          )
+        })
+      const pid = z.number().int().min(2).max(0xffffffff)
+      const member = z.object({ pid, started: birth })
+      const record = z
+        .object({
+          id: z
+            .string()
+            .min(1)
+            .max(1024)
+            .refine((value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value)),
+          pid,
+          started: z.union([birth, z.literal('')]),
+          isolatedGroup: z.boolean(),
+          members: z.array(member).max(50000).optional(),
+        })
+        .refine(
+          (entry) =>
+            entry.started !== '' || entry.members?.some((member) => member.pid !== entry.pid),
+          {
+            message: 'A missing leader birth requires a separately verified member identity.',
+          },
+        )
+      const records = z.array(record).max(10000).parse(raw)
+      const ids = new Set<string>()
+      for (const entry of records) {
+        if (ids.has(entry.id)) throw new Error('Duplicate process ownership record.')
+        ids.add(entry.id)
+        const existing = this.owned.get(entry.id)
+        if (
+          existing &&
+          (existing.pid !== entry.pid ||
+            existing.started !== entry.started ||
+            existing.isolatedGroup !== entry.isolatedGroup)
+        )
+          throw new Error('Conflicting process ownership identities.')
+      }
+      // Validate the complete file before admitting any record to process cleanup.
+      for (const entry of records) {
+        const existing = this.owned.get(entry.id)
+        this.owned.set(
+          entry.id,
+          existing
+            ? {
+                ...entry,
+                members: [
+                  ...new Map(
+                    [...(entry.members ?? []), ...(existing.members ?? [])].map((member) => [
+                      `${member.pid}:${member.started}`,
+                      member,
+                    ]),
+                  ).values(),
+                ],
+              }
+            : entry,
+        )
+      }
+      this.ownershipReadError = undefined
+    } catch {
+      this.ownershipReadError = new Error(
+        `[OWNERSHIP_RECORD_INVALID] 进程记录损坏/丢失，无法确认旧执行已停止，已暂停新执行。原文件保留在 ${file}。请保留原件，从可信备份修复该记录并恢复读取权限，再点击“重试恢复”；请勿直接删除或重置为空账本。`,
+      )
+      this.setHealth({
+        runtime: 'error',
+        code: 'OWNERSHIP_RECORD_INVALID',
+        message: this.ownershipReadError.message,
+      })
+    }
+  }
   private persistOwnership(): boolean {
+    if (this.ownershipReadError) return false
     try {
       const file = join(this.dataDir, 'owned-processes.json')
       writeFileSync(file + '.tmp', JSON.stringify([...this.owned.values()]), { mode: 0o600 })
@@ -227,25 +327,27 @@ export class ApplicationServices {
       .slice(0, 100)
   }
   /** Call only after the process ownership cleanup has confirmed that the old runtime cannot execute. */
-  private reconcileRecoveredTasks(): void {
+  private reconcileRecoveredTasks(
+    reason = '后台服务已退出，受管进程已确认停止；检查已中断，未自动重发。',
+  ): void {
+    this.assertOwnershipReadable()
+    // Stage every confirmed terminal state before disk writes, so retries keep the original recovery reason.
     for (const taskId of this.recoveringTasks) {
       const previous = this.tasks.get(taskId)
-      if (!previous) {
+      if (previous?.status === 'running')
+        this.tasks.set(taskId, {
+          ...previous,
+          status: 'cancelled',
+          finishedAt: Date.now(),
+          output: (previous.output + '\n' + reason + '\n').slice(-256 * 1024),
+        })
+    }
+    for (const taskId of this.recoveringTasks) {
+      const task = this.tasks.get(taskId)
+      if (!task) {
         this.recoveringTasks.delete(taskId)
         continue
       }
-      const task: TaskRun =
-        previous.status === 'running'
-          ? {
-              ...previous,
-              status: 'cancelled',
-              finishedAt: Date.now(),
-              output: (
-                previous.output + '\n后台服务已退出，受管进程已确认停止；检查已中断，未自动重发。\n'
-              ).slice(-256 * 1024),
-            }
-          : previous
-      this.tasks.set(task.id, task)
       try {
         this.saveArtifact('task:' + task.id, task)
       } catch (error) {
@@ -258,6 +360,7 @@ export class ApplicationServices {
     }
   }
   private async cleanOwnedProcesses(): Promise<void> {
+    this.assertOwnershipReadable()
     if (!this.owned.size) return
     try {
       while (this.owned.size) {
@@ -345,6 +448,12 @@ export class ApplicationServices {
   }
   private setHealth(patch: Partial<AppHealth>): void {
     Object.assign(this.healthState, patch)
+    if (this.ownershipReadError)
+      Object.assign(this.healthState, {
+        runtime: 'error',
+        code: 'OWNERSHIP_RECORD_INVALID',
+        message: this.ownershipReadError.message,
+      })
     this.broadcast('hub:health', { ...this.healthState })
   }
   private failStorage(error: unknown): void {
@@ -488,6 +597,7 @@ export class ApplicationServices {
     }
   }
   private writable(allowClosing = false): void {
+    this.assertOwnershipReadable()
     if (this.closing && !allowClosing) throw new Error('应用正在退出，请等待保存完成。')
     if (this.restoring) throw new Error('[DATA_RESTORE_BUSY] 正在恢复数据，请稍后重试。')
     if (this.healthState.storage !== 'ready')
@@ -522,6 +632,7 @@ export class ApplicationServices {
     return workspace
   }
   private trusted(workspace: Workspace): void {
+    this.assertOwnershipReadable()
     if (this.closing) throw new Error('应用正在退出，请等待保存完成。')
     if (this.restoring) throw new Error('正在恢复数据，请稍后重试。')
     if (workspace.deletedAt) throw new Error('工作区已清理，历史可查看导出，请新建会话。')
@@ -533,6 +644,7 @@ export class ApplicationServices {
       )
   }
   private async identity(workspace: Workspace): Promise<WorkspaceIdentity> {
+    this.assertOwnershipReadable()
     if (this.cleanup) await this.cleanup
     const result = await this.runtime.call<WorkspaceIdentity>('workspace.inspect', workspace.cwd)
     this.identities.set(workspace.id, result)
@@ -599,6 +711,7 @@ export class ApplicationServices {
     return acquire(0)
   }
   async ready(): Promise<void> {
+    this.assertOwnershipReadable()
     if (this.cleanup) await this.cleanup
     this.cleanup = undefined
     await this.runtime.start()
@@ -880,8 +993,17 @@ export class ApplicationServices {
           : z
               .object({
                 before: z.number().int().optional(),
+                after: z.number().int().optional(),
+                aroundEventId: id.optional(),
                 limit: z.number().int().min(1).max(500).default(100),
               })
+              .refine(
+                (value) =>
+                  [value.before, value.after, value.aroundEventId].filter(
+                    (boundary) => boundary !== undefined,
+                  ).length <= 1,
+                '历史分页只能指定一个定位边界。',
+              )
               .parse(page ?? {}),
       ),
     searchSessions: (query: unknown) =>
@@ -1097,6 +1219,7 @@ export class ApplicationServices {
       }
     },
     interrupt: async (value: unknown) => {
+      this.assertOwnershipReadable()
       if (this.cleanup) await this.cleanup
       const session = this.store.session(id.parse(value))
       if (!active(session.status)) return
@@ -1152,6 +1275,7 @@ export class ApplicationServices {
       await this.runtime.call('agent.respond', session.id, request, answer)
     },
     providers: (value?: unknown) => {
+      this.assertOwnershipReadable()
       if (this.closing) throw new Error('应用正在退出，请稍后再检测。')
       const workspace = value ? this.workspace(value) : undefined
       return this.runtime.call(
@@ -1507,21 +1631,46 @@ export class ApplicationServices {
         this.finalizing.size
       )
         throw new Error('任务或工作区操作尚未完成，请稍后再恢复。')
+      this.writable()
       this.restoring = true
+      let replaced = false
       try {
+        if (this.cleanup) await this.cleanup
+        this.cleanup = undefined
+        this.assertOwnershipReadable()
+        if (this.healthState.storage !== 'ready') throw new Error('请先恢复本地存储后再恢复备份。')
         this.eventBatcher.flush()
         for (const workspace of this.store.workspaces()) await this.assertIdle(workspace)
+        if ([...this.tasks.values()].some((task) => task.status === 'running'))
+          throw new Error('[WORKSPACE_BUSY] 请先停止全部检查任务，再恢复备份。')
         if (this.terminals.size) throw new Error('恢复数据前请先终止全部终端。')
+        // Idle CLI servers may retain ownership. No current Agent/task/PTY can own a running state from this backup.
         this.store.restoreBackup(z.string().max(200).parse(value))
+        this.dataGeneration = randomUUID()
+        replaced = true
+        this.tasks.clear()
+        this.recoveringTasks.clear()
+        for (const task of this.taskRecords()) {
+          if (task.status !== 'running') continue
+          this.tasks.set(task.id, task)
+          this.recoveringTasks.add(task.id)
+        }
+        this.reconcileRecoveredTasks('备份中的运行状态已中断，未自动重发。')
         if (this.store.restoreWarning)
           this.setHealth({
             code: 'RESTORE_PRESERVED_DAMAGED_OUTPUTS',
             message: this.store.restoreWarning,
           })
-        this.dataGeneration = randomUUID()
-        this.tasks.clear()
-        this.recoveringTasks.clear()
         this.broadcast('hub:sessions')
+      } catch (error) {
+        if (replaced) {
+          this.failStorage(error)
+          this.broadcast('hub:sessions')
+          throw new Error(
+            '[DATA_RESTORE_APPLIED] 备份已恢复，但部分本地状态尚未保存。窗口将重新加载，请在恢复界面重试本地存储。',
+          )
+        }
+        throw error
       } finally {
         this.restoring = false
       }
@@ -1564,6 +1713,10 @@ export class ApplicationServices {
     installUpdate: () => this.updates.install(),
     retryStorage: async () => {
       if (this.closing) throw new Error('应用正在退出，请等待保存完成。')
+      if (this.ownershipReadError) {
+        this.readOwnership()
+        this.assertOwnershipReadable()
+      }
       if (
         this.healthState.storage === 'ready' &&
         this.healthState.runtime === 'ready' &&
@@ -1629,6 +1782,7 @@ export class ApplicationServices {
     this.closing = false
   }
   async close(): Promise<void> {
+    this.assertOwnershipReadable()
     this.closing = true
     try {
       this.eventBatcher.flush()

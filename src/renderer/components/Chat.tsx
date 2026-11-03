@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
@@ -478,8 +478,11 @@ export interface ChatProps {
   settings?: Settings
   disabled?: boolean
   hasMore?: boolean
+  hasNewer?: boolean
   loadingMore?: boolean
   onLoadMore?: () => void
+  onLoadNewer?: () => void
+  onLatest?: () => void
   onInspectTurn?: (turnId: string) => void
   focusEventId?: string
 }
@@ -496,8 +499,11 @@ export default function Chat({
   settings,
   disabled,
   hasMore,
+  hasNewer,
   loadingMore,
   onLoadMore,
+  onLoadNewer,
+  onLatest,
   onInspectTurn,
   focusEventId,
 }: ChatProps) {
@@ -512,6 +518,10 @@ export default function Chat({
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const following = useRef(true)
+  const focusedEvent = useRef<string | undefined>(undefined)
+  const pagePosition = useRef<{ height: number; top: number; prepend: boolean } | undefined>(
+    undefined,
+  )
   const running = Boolean(session && ACTIVE_STATUSES.includes(session.status))
   const turnGroups = useMemo(() => {
     const groups = new Map<string, AgentEvent[]>()
@@ -592,10 +602,31 @@ export default function Chat({
       updateDraft({ ...current, context: [...current.context, context], updatedAt: Date.now() })
     clearContext()
   }, [context, draftLoading, session?.id])
+  useLayoutEffect(() => {
+    const position = pagePosition.current
+    const scroller = scrollRef.current
+    if (position && scroller) {
+      scroller.scrollTop =
+        position.top + (position.prepend ? scroller.scrollHeight - position.height : 0)
+      pagePosition.current = undefined
+    }
+  }, [events])
   useEffect(() => {
-    if (focusEventId)
-      document.getElementById(`event-${focusEventId}`)?.scrollIntoView({ block: 'center' })
-  }, [focusEventId, events])
+    if (!loadingMore) pagePosition.current = undefined
+  }, [loadingMore])
+  useLayoutEffect(() => {
+    if (loading) pagePosition.current = undefined
+    if (loading || !focusEventId) {
+      focusedEvent.current = undefined
+      return
+    }
+    if (focusedEvent.current === focusEventId) return
+    const target = document.getElementById(`event-${focusEventId}`)
+    if (target) {
+      target.scrollIntoView({ block: 'center' })
+      focusedEvent.current = focusEventId
+    }
+  }, [focusEventId, events, loading])
   useEffect(() => {
     if (following.current && !focusEventId)
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
@@ -668,6 +699,49 @@ export default function Chat({
             }[session.status]
           : '请选择会话'}
       </div>
+      {hasNewer && (
+        <div
+          className="history-navigation"
+          role="region"
+          aria-label="历史片段导航"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '8px 16px',
+            flexShrink: 0,
+          }}
+        >
+          <span>正在查看历史片段</span>
+          <button
+            className="button secondary small"
+            disabled={loadingMore}
+            onClick={() => {
+              const scroller = scrollRef.current
+              if (scroller)
+                pagePosition.current = {
+                  height: scroller.scrollHeight,
+                  top: scroller.scrollTop,
+                  prepend: false,
+                }
+              following.current = false
+              onLoadNewer?.()
+            }}
+          >
+            {loadingMore ? '正在加载…' : '加载更新的消息'}
+          </button>
+          <button
+            className="button secondary small"
+            onClick={() => {
+              pagePosition.current = undefined
+              following.current = true
+              onLatest?.()
+            }}
+          >
+            返回最新消息
+          </button>
+        </div>
+      )}
       <div
         ref={scrollRef}
         className="chat-scroll"
@@ -681,7 +755,17 @@ export default function Chat({
             <button
               className="button secondary history-more"
               disabled={loadingMore}
-              onClick={onLoadMore}
+              onClick={() => {
+                const scroller = scrollRef.current
+                if (scroller)
+                  pagePosition.current = {
+                    height: scroller.scrollHeight,
+                    top: scroller.scrollTop,
+                    prepend: true,
+                  }
+                following.current = false
+                onLoadMore?.()
+              }}
             >
               {loadingMore ? '正在加载…' : '加载更早的消息'}
             </button>
@@ -719,7 +803,7 @@ export default function Chat({
                 const content = (() => {
                   if (event.kind === 'user')
                     return (
-                      <div id={`event-${event.id}`} className="message user-message" key={event.id}>
+                      <div className="message user-message" key={event.id}>
                         <div className="user-bubble">
                           <Markdown>{event.text || ''}</Markdown>
                           {event.context?.map((item) => (
@@ -730,11 +814,7 @@ export default function Chat({
                     )
                   if (event.kind === 'text')
                     return (
-                      <div
-                        id={`event-${event.id}`}
-                        key={event.id}
-                        className="message assistant-message"
-                      >
+                      <div key={event.id} className="message assistant-message">
                         {index === 0 || !['text', 'tool'].includes(events[index - 1]?.kind) ? (
                           <div className="message-author">
                             <span
@@ -849,6 +929,7 @@ export default function Chat({
                 return content ? (
                   <div
                     key={`${event.turnId}:${event.kind}:${event.itemId ?? event.id}`}
+                    id={`event-${event.id}`}
                     className="conversation-event"
                     style={{
                       contentVisibility: focusEventId === event.id ? 'visible' : 'auto',

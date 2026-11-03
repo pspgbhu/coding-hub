@@ -256,9 +256,15 @@ function App() {
   const [searchIds, setSearchIds] = useState<Set<string>>(new Set())
   const [searchResults, setSearchResults] = useState<SessionSearchResult[]>([])
   const [focusEventId, setFocusEventId] = useState<string>()
+  const [historyTarget, setHistoryTarget] = useState<{ id: string; eventId?: string }>()
   const [before, setBefore] = useState<number>()
+  const [after, setAfter] = useState<number>()
   const [hasMore, setHasMore] = useState(false)
+  const [hasNewer, setHasNewer] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
+  const historyRequest = useRef(0)
+  const historyAtLatest = useRef(true)
+  const paging = useRef(false)
   const [searchPending, setSearchPending] = useState(false)
   const [archived, setArchived] = useState(false)
   const [trash, setTrash] = useState(false)
@@ -444,10 +450,10 @@ function App() {
         }),
       )
       if (event.sessionId === activeRef.current && !eventIds.current.has(event.id)) {
-        if (event.kind === 'done' && document.hasFocus())
+        if (event.kind === 'done' && document.hasFocus() && historyAtLatest.current)
           void api.updateSession(event.sessionId, { readAt: Date.now() }).catch(reportError)
         if (incoming.current?.id === event.sessionId) incoming.current.buffer.push(event)
-        else {
+        else if (historyAtLatest.current) {
           eventIds.current.add(event.id)
           setEvents((previous) => appendEvent(previous, event))
         }
@@ -491,12 +497,18 @@ function App() {
     if (api) return api.onHealth(setHealth)
   }, [])
   useEffect(() => {
+    const request = ++historyRequest.current
+    paging.current = false
+    setLoadingMore(false)
     setContext(pendingContext.current)
     pendingContext.current = undefined
     eventIds.current.clear()
     setEvents([])
     setHasMore(false)
+    setHasNewer(false)
     setBefore(undefined)
+    setAfter(undefined)
+    historyAtLatest.current = false
     incoming.current = null
     if (!sessionId || !api) {
       setLoadingSession(false)
@@ -504,26 +516,36 @@ function App() {
     }
     let stale = false
     const pending = { id: sessionId, buffer: [] as AgentEvent[] }
+    const anchor = historyTarget?.id === sessionId ? historyTarget.eventId : undefined
     incoming.current = pending
     setLoadingSession(true)
     void api
-      .getSession(sessionId, { limit: 100 })
+      .getSession(sessionId, { limit: 100, aroundEventId: anchor })
       .then((view) => {
-        if (stale) return
+        if (stale || request !== historyRequest.current) return
         setSessions((previous) =>
           previous.map((item) => (item.id === view.session.id ? view.session : item)),
         )
         const raw = [
           ...view.events,
-          ...pending.buffer.filter(
-            (event) => event.sequence !== undefined && event.sequence > view.cursor,
-          ),
+          ...(view.hasNewer
+            ? []
+            : pending.buffer.filter(
+                (event) => event.sequence !== undefined && event.sequence > view.cursor,
+              )),
         ]
+        historyAtLatest.current = !view.hasNewer
         eventIds.current = new Set(raw.map((event) => event.id))
         incoming.current = null
         setEvents(raw.reduce(appendEvent, [] as AgentEvent[]))
         setBefore(view.before)
+        setAfter(view.after)
         setHasMore(Boolean(view.hasMore))
+        setHasNewer(Boolean(view.hasNewer))
+        if (anchor && view.anchorFound === false) {
+          setFocusEventId(undefined)
+          reportError('搜索命中已不可用，已显示此会话最新消息。请重新搜索。')
+        }
       })
       .catch((error) => {
         if (stale) return
@@ -539,36 +561,64 @@ function App() {
       stale = true
       if (incoming.current === pending) incoming.current = null
     }
-  }, [sessionId, reportError])
-  async function loadMore() {
-    if (!sessionId || loadingMore || !hasMore) return
+  }, [sessionId, historyTarget, reportError])
+  async function loadMore(direction: 'older' | 'newer' = 'older') {
+    if (
+      !sessionId ||
+      loadingSession ||
+      paging.current ||
+      (direction === 'older' ? !hasMore : !hasNewer)
+    )
+      return
     const id = sessionId
+    const request = historyRequest.current
+    paging.current = true
     setLoadingMore(true)
+    const pending = direction === 'newer' ? { id, buffer: [] as AgentEvent[] } : undefined
+    if (pending) incoming.current = pending
     try {
-      const view = await api.getSession(id, { before, limit: 100 })
-      if (activeRef.current !== id) return
-      setEvents((previous) => [
-        ...view.events.filter((event) => !previous.some((item) => item.id === event.id)),
-        ...previous,
-      ])
-      setBefore(view.before)
-      setHasMore(Boolean(view.hasMore))
+      const view = await api.getSession(id, {
+        ...(direction === 'older' ? { before } : { after }),
+        limit: 100,
+      })
+      if (activeRef.current !== id || request !== historyRequest.current) return
+      const raw = [
+        ...view.events,
+        ...(pending && !view.hasNewer
+          ? pending.buffer.filter(
+              (event) => event.sequence !== undefined && event.sequence > view.cursor,
+            )
+          : []),
+      ]
+      for (const event of raw) eventIds.current.add(event.id)
+      setEvents((previous) =>
+        direction === 'older'
+          ? [...raw.filter((event) => !previous.some((item) => item.id === event.id)), ...previous]
+          : raw.reduce(appendEvent, previous),
+      )
+      if (direction === 'older') {
+        setBefore(view.before)
+        setHasMore(Boolean(view.hasMore))
+      } else {
+        setAfter(view.after)
+        setHasNewer(Boolean(view.hasNewer))
+        historyAtLatest.current = !view.hasNewer
+      }
     } catch (error) {
-      reportError(error)
+      if (request === historyRequest.current) reportError(error)
     } finally {
-      setLoadingMore(false)
+      if (incoming.current === pending) incoming.current = null
+      if (request === historyRequest.current) {
+        paging.current = false
+        setLoadingMore(false)
+      }
     }
   }
-  useEffect(() => {
-    if (
-      focusEventId &&
-      !events.some((event) => event.id === focusEventId) &&
-      hasMore &&
-      !loadingSession &&
-      !loadingMore
-    )
-      void loadMore()
-  }, [focusEventId, events, hasMore, loadingSession, loadingMore])
+  function latestHistory() {
+    if (!sessionId) return
+    setFocusEventId(undefined)
+    setHistoryTarget({ id: sessionId })
+  }
   function toggleTerminal() {
     if (!activeWorkspace || !project?.trusted) return
     if (!terminal)
@@ -593,6 +643,7 @@ function App() {
     }
     setProjectId(item.projectId)
     setSessionId(item.id)
+    setHistoryTarget({ id: item.id, eventId })
     setMenuId(undefined)
     setFocusEventId(eventId)
     setInspection(undefined)
@@ -1349,7 +1400,7 @@ function App() {
                     loading={loadingSession}
                     provider={providers.find((item) => item.id === session.provider)}
                     onSend={(text) => {
-                      setFocusEventId(undefined)
+                      if (hasNewer || focusEventId) latestHistory()
                       return api.sendMessage(session.id, text)
                     }}
                     onStop={() => void api.interrupt(session.id).catch(reportError)}
@@ -1361,8 +1412,11 @@ function App() {
                       !project.trusted || health.storage === 'error' || Boolean(session.deletedAt)
                     }
                     hasMore={hasMore}
+                    hasNewer={hasNewer}
                     loadingMore={loadingMore}
                     onLoadMore={() => void loadMore()}
+                    onLoadNewer={() => void loadMore('newer')}
+                    onLatest={latestHistory}
                     onInspectTurn={setInspection}
                     focusEventId={focusEventId}
                   />

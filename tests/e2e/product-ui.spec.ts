@@ -233,6 +233,8 @@ test('one thousand stored sessions mount only visible sidebar rows and old searc
   const firstHistoryRenderMs = performance.now() - historyStart
   const metrics = {
     recordedAt: new Date().toISOString(),
+    executionMode: process.env.CODING_HUB_PACKAGED_APP ? 'packaged' : 'source',
+    packagedExecutable: process.env.CODING_HUB_PACKAGED_APP,
     sessionCount: 1000,
     conversationEvents: 10000,
     firstHistoryEvents: 100,
@@ -283,6 +285,10 @@ test('one thousand stored sessions mount only visible sidebar rows and old searc
   await expect(
     page.locator('.conversation').getByText('HISTORY_NEEDLE_OLD', { exact: true }),
   ).toBeVisible()
+  // A search jump must mount a bounded window, even when the match is 9,995 events old.
+  await expect(page.locator('.conversation .assistant-message')).toHaveCount(100)
+  await expect(page.getByRole('region', { name: '历史片段导航', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '返回最新消息', exact: true })).toBeVisible()
   const event = page
     .locator('.conversation-event')
     .filter({ has: page.getByText('HISTORY_NEEDLE_OLD', { exact: true }) })
@@ -290,6 +296,32 @@ test('one thousand stored sessions mount only visible sidebar rows and old searc
   await expect(page.locator('.conversation-event').first()).toHaveCSS('content-visibility', 'auto')
   await mkdir(resolve('coverage/visuals'), { recursive: true })
   await page.screenshot({ path: 'coverage/visuals/product-windowed-history.png' })
+  await page.getByRole('button', { name: '加载更新的消息', exact: true }).click()
+  await expect(page.locator('.conversation .assistant-message')).toHaveCount(200)
+  await expect(
+    page.locator('.conversation').getByText('History message 199', { exact: true }),
+  ).toHaveCount(1)
+  await page.getByRole('button', { name: '返回最新消息', exact: true }).click()
+  await expect(page.locator('.conversation .assistant-message')).toHaveCount(100)
+  await expect(
+    page.locator('.conversation').getByText('History message 9999', { exact: true }),
+  ).toBeVisible()
+  await expect(page.getByRole('region', { name: '历史片段导航', exact: true })).toHaveCount(0)
+  await expect(
+    page.locator('.conversation').getByText('HISTORY_NEEDLE_OLD', { exact: true }),
+  ).toHaveCount(0)
+  await page.getByRole('textbox', { name: '搜索会话', exact: true }).fill('History message 5000')
+  await expect(list.locator('.session-select').first()).toContainText('History message 5000')
+  await list.locator('.session-select').first().click()
+  await expect(
+    page.locator('.conversation').getByText('History message 5000', { exact: true }),
+  ).toBeVisible()
+  await expect(page.locator('.conversation .assistant-message')).toHaveCount(100)
+  await page.getByRole('button', { name: '加载更早的消息', exact: true }).click()
+  await expect(page.locator('.conversation .assistant-message')).toHaveCount(200)
+  await expect(
+    page.locator('.conversation').getByText('History message 4850', { exact: true }),
+  ).toHaveCount(1)
 })
 
 test('an unborn repository defaults to shared workspace and command shortcuts stay separate', async ({

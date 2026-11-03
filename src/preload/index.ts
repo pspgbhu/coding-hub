@@ -61,7 +61,6 @@ const methods = [
   'terminalAttach',
   'listBackups',
   'createBackup',
-  'restoreBackup',
   'storageInfo',
   'revealData',
   'exportDiagnostics',
@@ -102,9 +101,21 @@ for (const method of methods)
     const result = await ipcRenderer.invoke(`hub:${method}`, ...args)
     if (method === 'bootstrap' && dataGeneration === undefined)
       dataGeneration = result.dataGeneration
-    if (method === 'restoreBackup') window.location.reload()
     return result
   }
+// Only this fixed operation may replace the data generation and invalidate every page cache.
+api.restoreBackup = async (value: unknown) => {
+  let result: unknown
+  try {
+    result = await ipcRenderer.invoke('hub:restoreBackup', value)
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('[DATA_RESTORE_APPLIED]'))
+      window.location.reload()
+    throw error
+  }
+  window.location.reload()
+  return result
+}
 for (const [method, channel] of [
   ['onEvent', 'hub:event'],
   ['onTerminal', 'hub:terminal'],

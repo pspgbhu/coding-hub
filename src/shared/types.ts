@@ -266,12 +266,21 @@ export interface AgentEvent {
   resolution?: 'approved' | 'denied' | 'cancelled' | 'expired' | 'external' | 'failed'
   answers?: Record<string, string[]>
 }
+export interface SessionPage {
+  before?: number
+  after?: number
+  aroundEventId?: string
+  limit?: number
+}
 export interface SessionView {
   session: Session
   events: AgentEvent[]
   cursor: number
   before?: number
   hasMore?: boolean
+  after?: number
+  hasNewer?: boolean
+  anchorFound?: boolean
 }
 export interface Bootstrap {
   projects: Project[]
@@ -363,7 +372,7 @@ export interface AppAPI {
     isolated?: boolean
     base?: string
   }): Promise<Session>
-  getSession(id: string, page?: { before?: number; limit?: number }): Promise<SessionView>
+  getSession(id: string, page?: SessionPage): Promise<SessionView>
   searchSessions(query: string): Promise<SessionSearchResult[]>
   updateSession(
     id: string,

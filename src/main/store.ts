@@ -12,6 +12,7 @@ import type {
   Session,
   Settings,
   SessionView,
+  SessionPage,
   SessionSearchResult,
   StorageInfo,
   Workspace,
@@ -298,29 +299,69 @@ export class Store {
     this.db.prepare('UPDATE sessions SET data = ? WHERE id = ?').run(JSON.stringify(session), id)
     return session
   }
-  view(id: string, options: { before?: number; limit?: number } = {}): SessionView {
-    const paged = options.limit !== undefined || options.before !== undefined
+  view(id: string, options: SessionPage = {}): SessionView {
+    if (
+      [options.before, options.after, options.aroundEventId].filter((value) => value !== undefined)
+        .length > 1
+    )
+      throw new Error('历史分页只能指定一个定位边界。')
+    const session = this.session(id)
+    const paged =
+      options.limit !== undefined ||
+      options.before !== undefined ||
+      options.after !== undefined ||
+      options.aroundEventId !== undefined
     const limit = Math.max(1, Math.min(1000, Math.trunc(options.limit ?? 100)))
-    const before = options.before ?? Number.MAX_SAFE_INTEGER
-    const rows = (
-      paged
-        ? this.db
-            .prepare(
-              'SELECT data, ordinal FROM events WHERE session_id = ? AND ordinal < ? ORDER BY ordinal DESC LIMIT ?',
-            )
-            .all(id, before, limit + 1)
-        : this.db
-            .prepare('SELECT data, ordinal FROM events WHERE session_id = ? ORDER BY ordinal')
-            .all(id)
-    ) as { data: string; ordinal: number }[]
-    const hasMore = paged && rows.length > limit
-    const page = paged ? rows.slice(0, limit).reverse() : rows
+    type Row = { data: string; ordinal: number }
+    const older = (before: number, count: number) =>
+      this.db
+        .prepare(
+          'SELECT data, ordinal FROM events WHERE session_id = ? AND ordinal < ? ORDER BY ordinal DESC LIMIT ?',
+        )
+        .all(id, before, count) as Row[]
+    const newer = (after: number, count: number, inclusive = false) =>
+      this.db
+        .prepare(
+          `SELECT data, ordinal FROM events WHERE session_id = ? AND ordinal ${inclusive ? '>=' : '>'} ? ORDER BY ordinal LIMIT ?`,
+        )
+        .all(id, after, count) as Row[]
+    const anchor =
+      options.aroundEventId === undefined
+        ? undefined
+        : (this.db
+            .prepare('SELECT ordinal FROM events WHERE id = ? AND session_id = ?')
+            .get(options.aroundEventId, id) as { ordinal: number } | undefined)
+    let page: Row[]
+    if (!paged)
+      page = this.db
+        .prepare('SELECT data, ordinal FROM events WHERE session_id = ? ORDER BY ordinal')
+        .all(id) as Row[]
+    else if (anchor) {
+      let leading = older(anchor.ordinal, Math.floor(limit / 2))
+      const trailing = newer(anchor.ordinal, limit - leading.length, true)
+      if (leading.length + trailing.length < limit)
+        leading = older(anchor.ordinal, limit - trailing.length)
+      page = [...leading.reverse(), ...trailing]
+    } else if (options.after !== undefined) page = newer(options.after, limit)
+    else page = older(options.before ?? Number.MAX_SAFE_INTEGER, limit).reverse()
+    const before = page[0]?.ordinal
+    const after = page.at(-1)?.ordinal
+    const exists = (operator: '<' | '>', boundary: number | undefined) =>
+      boundary !== undefined &&
+      Boolean(
+        this.db
+          .prepare(`SELECT 1 FROM events WHERE session_id = ? AND ordinal ${operator} ? LIMIT 1`)
+          .get(id, boundary),
+      )
     return {
-      session: this.session(id),
+      session,
       cursor: this.sequence,
       events: page.map((row) => JSON.parse(row.data)),
-      before: page[0]?.ordinal,
-      hasMore,
+      before,
+      after,
+      hasMore: paged && exists('<', before),
+      hasNewer: paged && exists('>', after),
+      anchorFound: options.aroundEventId === undefined ? undefined : Boolean(anchor),
     }
   }
   getDraft(sessionId: string): ComposerDraft {
