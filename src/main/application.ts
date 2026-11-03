@@ -237,9 +237,11 @@ export class ApplicationServices {
         })
         .refine(
           (entry) =>
-            entry.started !== '' || entry.members?.some((member) => member.pid !== entry.pid),
+            entry.started !== '' ||
+            entry.members?.some((member) => member.pid !== entry.pid) ||
+            !!entry.uncertainMembers?.length,
           {
-            message: 'A missing leader birth requires a separately verified member identity.',
+            message: 'A missing leader birth requires a verified member or retained uncertainty.',
           },
         )
       const records = z.array(record).max(10000).parse(raw)

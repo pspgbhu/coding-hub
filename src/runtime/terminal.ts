@@ -3,6 +3,7 @@ import { realpath } from 'node:fs/promises'
 import type { IPty } from 'node-pty'
 import type { EmitTerminal } from '../shared/runtime'
 import type { TerminalDescriptor } from '../shared/types'
+import { ensureWindowsProcessApi } from './windows-process'
 import {
   getProcessEnvironment,
   ownProcessTree,
@@ -33,6 +34,7 @@ export class TerminalService {
 
   async create(root: string, cols: number, rows: number, workspaceId?: string): Promise<string> {
     if (this.closing) throw new Error('The terminal service is closing')
+    if (process.platform === 'win32') ensureWindowsProcessApi()
     await prepareEnvironment()
     const cwd = await realpath(root)
     const dimensions = this.dimensions(cols, rows)

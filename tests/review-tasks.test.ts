@@ -101,27 +101,42 @@ describe('explicit project checks', () => {
     expect(await tasks.definitions(root)).toEqual([
       { id: 'test', name: 'test', command: 'pnpm', args: ['run', 'test'] },
     ])
-    let completed: TaskRun | undefined
-    tasks = new TaskService((run) => {
-      if (run.status !== 'running') completed = run
+    let resolveCompleted!: (run: TaskRun) => void
+    const completed = new Promise<TaskRun>((resolve) => {
+      resolveCompleted = resolve
     })
-    const run = await tasks.run(root, data, randomUUID(), {
+    tasks = new TaskService((run) => {
+      if (run.status !== 'running') resolveCompleted(run)
+    })
+    const workspace = randomUUID()
+    const marker = join(root, 'check-executed')
+    const run = await tasks.run(root, data, workspace, {
       id: 'explicit',
       name: 'check fixture',
       command: process.execPath,
-      args: ['-e', 'console.log("中文验证");process.exit(3)'],
+      args: [
+        '-e',
+        `require('fs').writeFileSync(${JSON.stringify(marker)},'executed');console.log("中文验证");process.exit(3)`,
+      ],
     })
-    await expect.poll(() => completed?.status).toBe('failed')
-    expect(completed?.exitCode).toBe(3)
-    expect(completed?.output).toContain('中文验证')
-    await expect
-      .poll(
-        async () =>
-          JSON.parse(await readFile(join(data, 'tasks', run.id + '.json'), 'utf8')).status,
-      )
-      .toBe('failed')
+    // Startup acknowledgement precedes verified process cleanup and persistence.
+    // The terminal event is the completion barrier, within the existing test budget.
+    const result = await completed
+    expect(result).toMatchObject({
+      id: run.id,
+      workspaceId: workspace,
+      status: 'failed',
+      exitCode: 3,
+    })
+    expect(result.finishedAt).toBeGreaterThanOrEqual(run.startedAt)
+    expect(result.output).toContain('中文验证')
+    expect(await readFile(marker, 'utf8')).toBe('executed')
+    const stored: TaskRun = JSON.parse(
+      await readFile(join(data, 'tasks', run.id + '.json'), 'utf8'),
+    )
+    expect(stored).toEqual(result)
     const reopened = new TaskService(() => {})
-    expect((await reopened.list(data))[0].exitCode).toBe(3)
+    expect((await reopened.list(data, workspace))[0]).toEqual(result)
   })
   it('prevents a second check in the same workspace and allows explicit cancellation', async () => {
     const workspace = randomUUID()
@@ -140,6 +155,6 @@ describe('explicit project checks', () => {
       }),
     ).rejects.toThrow('正在运行')
     await tasks.cancel(run.id)
-    await expect.poll(async () => (await tasks.list(data, workspace))[0].status).toBe('cancelled')
+    expect((await tasks.list(data, workspace))[0].status).toBe('cancelled')
   })
 })

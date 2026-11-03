@@ -262,6 +262,31 @@ describe('process ownership ledger recovery is fail closed', () => {
     },
   )
 
+  it('keeps an uncertainty-only record recoverable without promoting its unverified root', async () => {
+    persistRunningTask()
+    const record = nativeRecord({
+      started: '',
+      members: [],
+      uncertainMembers: [{ pid: 12345, started: '639293256000000000' }],
+    })
+    fs.writeFileSync(file, JSON.stringify([record]))
+    fixture.cleanup.mockRejectedValue(new Error('Cannot verify process descendants'))
+    const service = open()
+    await expect(service.ready()).rejects.toThrow('Cannot verify process descendants')
+    expect(service.healthState.code).toBe('PROCESS_CLEANUP_FAILED')
+    expect(fixture.cleanup).toHaveBeenCalledWith([record])
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual([record])
+    await expect(service.handlers.retryStorage()).rejects.toThrow(
+      'Cannot verify process descendants',
+    )
+    expect(fixture.cleanup.mock.calls.at(-1)?.[0]).toEqual([record])
+    expect(readTask().status).toBe('running')
+    fixture.cleanup.mockResolvedValue(undefined)
+    await service.handlers.retryStorage()
+    expect(readTask().status).toBe('cancelled')
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual([])
+  })
+
   it('allows a genuine first launch without a ledger or running task history', async () => {
     const service = open()
     await service.ready()

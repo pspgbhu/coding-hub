@@ -5,6 +5,12 @@ import os from 'node:os'
 import path from 'node:path'
 import crossSpawn from 'cross-spawn'
 import { randomUUID } from 'node:crypto'
+import {
+  acquireWindowsProcess,
+  ensureWindowsProcessApi,
+  openVerifiedWindowsProcess,
+  type WindowsProcessLease,
+} from './windows-process'
 
 let environment: NodeJS.ProcessEnv = { ...process.env }
 let prepared: Promise<NodeJS.ProcessEnv> | undefined
@@ -288,6 +294,240 @@ function signalOwnedProcess(entry: ProcessIdentity, signal: NodeJS.Signals): voi
   }
 }
 
+function uncertainWindowsProcessAlive(pid: number, started: string): boolean {
+  const lease = openVerifiedWindowsProcess(pid, started)
+  if (!lease) return false
+  try {
+    return lease.isAlive()
+  } finally {
+    lease.close()
+  }
+}
+
+/** Windows PIDs stay reserved while these native process-object handles remain open. */
+function ownWindowsProcessTree(
+  pid: number,
+  isRunning: () => boolean,
+  expectedStarted: string | undefined,
+  expectedMembers: { pid: number; started: string }[],
+): OwnedProcessTree {
+  const local = expectedStarted === undefined
+  let rootStarted = expectedStarted
+  let released = false
+  let cleanupUnconfirmed = true
+  let pending: Promise<void> | undefined
+  let captureError: unknown
+  let capturedRoot = false
+  let identity: ProcessOwnership | undefined
+  let published = ''
+  const known = new Map(
+    expectedMembers
+      .filter(
+        (member) => member.pid !== pid || (expectedStarted && member.started === expectedStarted),
+      )
+      .map((member) => [member.pid, member.started]),
+  )
+  const leases = new Map<number, WindowsProcessLease>()
+  const uncertain = new Map<number, string>()
+  const uncertainHistory = new Map<number, string>()
+  const publish = (): void => {
+    if (released || (!known.size && !uncertain.size)) return
+    const data = {
+      pid,
+      started: rootStarted ?? '',
+      isolatedGroup: false,
+      members: [...known].map(([pid, started]) => ({ pid, started })),
+      ...(uncertain.size
+        ? { uncertainMembers: [...uncertain].map(([pid, started]) => ({ pid, started })) }
+        : {}),
+    }
+    const signature = JSON.stringify(data)
+    if (signature === published) return
+    published = signature
+    identity = { id: identity?.id ?? randomUUID(), ...data }
+    ownershipObserver?.({ action: 'register', process: identity })
+  }
+  try {
+    // Only a synchronous, still-owned launch may establish a new root identity.
+    // Recovery must supply its previously recorded birth and verify it natively.
+    const root = local
+      ? isRunning()
+        ? acquireWindowsProcess(pid)
+        : undefined
+      : expectedStarted
+        ? openVerifiedWindowsProcess(pid, expectedStarted)
+        : undefined
+    if (root) {
+      capturedRoot = true
+      rootStarted = root.started
+      known.set(pid, root.started)
+      leases.set(pid, root)
+    }
+    for (const [memberPid, started] of known) {
+      if (memberPid === process.pid || memberPid <= 1 || leases.has(memberPid)) continue
+      const member = openVerifiedWindowsProcess(memberPid, started)
+      if (member) leases.set(memberPid, member)
+    }
+  } catch (error) {
+    captureError = error
+  }
+  publish()
+  const observe = (snapshot: ProcessIdentity[]): number => {
+    const before = known.size
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const entry of snapshot) {
+        if (
+          entry.pid <= 1 ||
+          entry.pid === process.pid ||
+          leases.has(entry.pid) ||
+          uncertainHistory.get(entry.pid) === entry.started
+        )
+          continue
+        const parent = leases.get(entry.parent)
+        // A pinned parent cannot be recycled, even after it exits. Birth order
+        // rejects stale ParentProcessId links to processes older than that parent.
+        if (!parent || BigInt(entry.started) < BigInt(parent.started)) continue
+        const candidate = acquireWindowsProcess(entry.pid)
+        if (!candidate) continue
+        if (candidate.started !== entry.started) {
+          // The enumerated PID changed before native acquisition. Its old PPID
+          // cannot establish the new object's ancestry. Older objects are foreign;
+          // otherwise retain uncertainty without ever sending a termination.
+          if (BigInt(candidate.started) >= BigInt(parent.started)) {
+            uncertain.set(candidate.pid, candidate.started)
+            uncertainHistory.set(candidate.pid, candidate.started)
+          }
+          candidate.close()
+          continue
+        }
+        leases.set(entry.pid, candidate)
+        known.set(entry.pid, candidate.started)
+        changed = true
+      }
+    }
+    // A numeric parent without a pinned identity is evidence of uncertainty,
+    // never permission to adopt or terminate that process (including a root PID).
+    const candidates = new Map<number, string>()
+    const unpinned = new Map<number, string | undefined>()
+    for (const [memberPid, started] of uncertainHistory) {
+      const current = snapshot.find((entry) => entry.pid === memberPid)
+      if (!current || current.started === started) unpinned.set(memberPid, started)
+    }
+    for (const [memberPid, started] of known) {
+      const current = snapshot.find((entry) => entry.pid === memberPid)
+      if (!leases.has(memberPid) && (!current || current.started === started))
+        unpinned.set(memberPid, started)
+    }
+    if (!leases.has(pid)) {
+      const current = snapshot.find((entry) => entry.pid === pid)
+      if (!rootStarted || !current || current.started === rootStarted)
+        unpinned.set(pid, rootStarted)
+      if (local && !rootStarted && current) candidates.set(current.pid, current.started)
+    }
+    changed = true
+    while (changed) {
+      changed = false
+      for (const entry of snapshot) {
+        if (entry.pid <= 1 || entry.pid === process.pid || leases.has(entry.pid)) continue
+        const parentBirth = unpinned.get(entry.parent)
+        if (
+          !unpinned.has(entry.parent) ||
+          (parentBirth && BigInt(entry.started) < BigInt(parentBirth)) ||
+          candidates.has(entry.pid)
+        )
+          continue
+        candidates.set(entry.pid, entry.started)
+        unpinned.set(entry.pid, entry.started)
+        changed = true
+      }
+    }
+    for (const [candidatePid, started] of candidates) {
+      uncertain.set(candidatePid, started)
+      uncertainHistory.set(candidatePid, started)
+    }
+    publish()
+    return known.size - before
+  }
+  const initial = processSnapshot()
+    .then(observe)
+    .catch(() => {})
+  const tree: OwnedProcessTree = {
+    release() {
+      if (released || cleanupUnconfirmed || uncertain.size) return
+      // A failed CloseHandle must retain ownership and allow a later retry.
+      for (const [memberPid, lease] of leases) {
+        lease.close()
+        leases.delete(memberPid)
+      }
+      released = true
+      ownedTrees.delete(tree)
+      if (identity) ownershipObserver?.({ action: 'release', process: identity })
+    },
+    terminate() {
+      if (pending) return pending
+      if (released) return Promise.resolve()
+      pending = (async () => {
+        await initial
+        const snapshot = await processSnapshot()
+        for (const [memberPid, started] of uncertain) {
+          if (!uncertainWindowsProcessAlive(memberPid, started)) uncertain.delete(memberPid)
+        }
+        observe(snapshot)
+        if (uncertain.size)
+          throw new Error('Cannot verify process descendants. Ownership was retained.')
+        if (captureError) throw captureError
+        if (local && !capturedRoot && isRunning())
+          throw new Error('Cannot verify the launched process identity. Ownership was retained.')
+        // Each lease is a process object, not a numeric PID kill. Never delegate
+        // tree traversal to taskkill /T, which can exceed this verified set.
+        const targets = [...leases.values()]
+        for (const target of targets.reverse()) {
+          if (!target.isAlive()) continue
+          const fresh = await processSnapshot()
+          const added = observe(fresh)
+          if (uncertain.size || added)
+            throw new Error(
+              'New descendants require another confirmed cleanup. Ownership was retained.',
+            )
+          if (target.isAlive()) target.terminate()
+        }
+        const deadline = Date.now() + 4000
+        while ([...leases.values()].some((lease) => lease.isAlive())) {
+          if (Date.now() >= deadline)
+            throw new Error('Owned processes did not stop. Ownership was retained.')
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        const after = await processSnapshot()
+        const added = observe(after)
+        if (uncertain.size || added || [...leases.values()].some((lease) => lease.isAlive()))
+          throw new Error(
+            'New descendants require another confirmed cleanup. Ownership was retained.',
+          )
+      })().then(
+        () => {
+          cleanupUnconfirmed = false
+          try {
+            tree.release()
+          } catch (error) {
+            cleanupUnconfirmed = true
+            pending = undefined
+            throw error
+          }
+        },
+        (error) => {
+          pending = undefined
+          throw error
+        },
+      )
+      return pending
+    },
+  }
+  ownedTrees.add(tree)
+  return tree
+}
+
 /** Only call for processes created by this application; renderer-supplied PIDs are forbidden. */
 export function ownProcessTree(
   pid: number,
@@ -298,6 +538,8 @@ export function ownProcessTree(
 ): OwnedProcessTree {
   if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid)
     throw new Error('Invalid owned process')
+  if (process.platform === 'win32')
+    return ownWindowsProcessTree(pid, isRunning, expectedStarted, expectedMembers)
   let released = false
   let cleanupUnconfirmed = true
   let pending: Promise<void> | undefined
@@ -310,7 +552,6 @@ export function ownProcessTree(
   )
   const unverifiedLate = new Map<number, string>()
   const local = expectedStarted === undefined
-  const bornAfter = Date.now() - 1000
   const publish = (): void => {
     if (released || (!known.size && !unverifiedLate.size)) return
     identity = {
@@ -365,11 +606,6 @@ export function ownProcessTree(
         else if (local && !root && isolatedGroup && process.platform !== 'win32') {
           // A live POSIX process group reserves its ID even after its leader exits.
           targets = descendantProcesses(snapshot, pid, true)
-        } else if (local && !root && process.platform === 'win32') {
-          const candidates = descendantProcesses(snapshot, pid, false)
-          // Windows retains the creating parent PID. Exclude processes older than this launch.
-          const floor = BigInt(Math.trunc(bornAfter)) * 10000n + 621355968000000000n
-          targets = candidates.filter((entry) => BigInt(entry.started) >= floor)
         } else targets = knownTargets
         if (!local && !rootMatches && !knownTargets.length) {
           if (root) return // A recycled leader PID must never be targeted.
@@ -435,62 +671,15 @@ export function ownProcessTree(
             'New descendants require another confirmed cleanup. Ownership was retained.',
           )
         }
-        if (process.platform === 'win32') {
-          const command = path.join(
-            process.env.SystemRoot || 'C:\\Windows',
-            'System32',
-            'taskkill.exe',
-          )
-          for (const target of targets.filter((entry) => !rootMatches || entry.pid === pid)) {
-            const fresh = await processSnapshot()
-            const current = fresh.find(
-              (entry) => entry.pid === target.pid && entry.started === target.started,
-            )
-            if (!current) {
-              rejectLateDescendants(fresh)
-              continue
-            }
-            await new Promise<void>((resolve, reject) => {
-              const killer = spawn(command, ['/PID', String(target.pid), '/T', '/F'], {
-                windowsHide: true,
-                stdio: 'ignore',
-                shell: false,
-              })
-              const timer = setTimeout(() => {
-                killer.kill()
-                reject(new Error('Process tree termination timed out'))
-              }, 4000)
-              killer.once('error', (error) => {
-                clearTimeout(timer)
-                reject(error)
-              })
-              killer.once('close', (code) => {
-                clearTimeout(timer)
-                if (code === 0) resolve()
-                else
-                  void processSnapshot().then(
-                    (current) =>
-                      current.some(
-                        (entry) => entry.pid === target.pid && entry.started === target.started,
-                      )
-                        ? reject(new Error('Unable to terminate owned process tree'))
-                        : resolve(),
-                    reject,
-                  )
-              })
-            })
-          }
-        } else {
-          for (const target of targets.filter((entry) => entry.pid !== pid))
-            signalOwnedProcess(target, force ? 'SIGKILL' : 'SIGTERM')
-          const leader = targets.find((entry) => entry.pid === pid)
-          if (leader) signalOwnedProcess(leader, force ? 'SIGKILL' : 'SIGTERM')
-          if (!force) await new Promise((resolve) => setTimeout(resolve, 600))
-          const remaining = new Map((await processSnapshot()).map((entry) => [entry.pid, entry]))
-          for (const before of targets) {
-            const after = remaining.get(before.pid)
-            if (after && after.started === before.started) signalOwnedProcess(after, 'SIGKILL')
-          }
+        for (const target of targets.filter((entry) => entry.pid !== pid))
+          signalOwnedProcess(target, force ? 'SIGKILL' : 'SIGTERM')
+        const leader = targets.find((entry) => entry.pid === pid)
+        if (leader) signalOwnedProcess(leader, force ? 'SIGKILL' : 'SIGTERM')
+        if (!force) await new Promise((resolve) => setTimeout(resolve, 600))
+        const remaining = new Map((await processSnapshot()).map((entry) => [entry.pid, entry]))
+        for (const before of targets) {
+          const after = remaining.get(before.pid)
+          if (after && after.started === before.started) signalOwnedProcess(after, 'SIGKILL')
         }
         await new Promise((resolve) => setTimeout(resolve, 80))
         const after = await processSnapshot()
@@ -531,9 +720,32 @@ export async function terminateOwnedProcesses(records: ProcessOwnership[]): Prom
   await Promise.all(
     records.map(async (record) => {
       if (
-        record.uncertainMembers?.some((member) =>
-          snapshot.some((entry) => entry.pid === member.pid && entry.started === member.started),
-        )
+        record.uncertainMembers?.some((member) => {
+          if (
+            process.platform === 'win32' &&
+            uncertainWindowsProcessAlive(member.pid, member.started)
+          )
+            return true
+          const current = snapshot.find((entry) => entry.pid === member.pid)
+          if (current) return current.started === member.started
+          const suspected = new Map([[member.pid, member.started]])
+          let changed = true
+          while (changed) {
+            changed = false
+            for (const entry of snapshot) {
+              const parentBirth = suspected.get(entry.parent)
+              if (
+                parentBirth &&
+                !suspected.has(entry.pid) &&
+                (process.platform !== 'win32' || BigInt(entry.started) >= BigInt(parentBirth))
+              ) {
+                suspected.set(entry.pid, entry.started)
+                changed = true
+              }
+            }
+          }
+          return suspected.size > 1
+        })
       ) {
         failures.push(new Error('Cannot verify late process descendants. Ownership was retained.'))
         return
@@ -712,6 +924,7 @@ export function launch(
   if ([command, ...args].some((value) => value.includes('\0')))
     throw new Error('Command contains an invalid NUL character')
   const childEnv = getProcessEnvironment(env)
+  if (process.platform === 'win32') ensureWindowsProcessApi()
   const child = crossSpawn(command, args, {
     cwd,
     env: childEnv,

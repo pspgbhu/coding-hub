@@ -3,4 +3,5 @@ allowBuilds:
   esbuild: true
   better-sqlite3: true
   node-pty: true
+  koffi: true
   electron-winstaller: false

@@ -16,6 +16,7 @@ asar: true
 afterExtract: scripts/native-deps.cjs
 asarUnpack:
   - '**/*.node'
+  - '**/@koromix/koffi-*/**'
   - '**/node-pty/**'
   - '**/@anthropic-ai/**'
 mac:
