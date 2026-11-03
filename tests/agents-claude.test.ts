@@ -14,6 +14,7 @@ vi.mock('../src/runtime/process', () => ({
   terminateProcessTree: async (child: ReturnType<typeof spawn>) => {
     child.kill()
   },
+  finalizeOwnedChild: async () => {},
 }))
 import { ClaudeAdapter } from '../src/runtime/adapters/claude'
 
@@ -41,6 +42,7 @@ describe('official Claude SDK through the user CLI process', () => {
         if(m.type==='control_request'&&m.request.subtype==='initialize')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{commands:[],agents:[],output_style:'default',available_output_styles:[],models:[],account:{}}}});
         if(m.type==='control_request'&&m.request.subtype==='interrupt')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{}}});
         if(m.type==='user'){
+          if(m.message.content[1]?.type!=='image'||m.message.content[1].source.type!=='base64')process.exit(10);
           send({type:'system',subtype:'init',session_id:'native-existing',uuid:'init'});
           send({type:'control_request',request_id:'approval-1',request:{subtype:'can_use_tool',tool_name:'Bash',input:{command:'echo hello'},tool_use_id:'tool-1'}});
         }
@@ -66,7 +68,24 @@ describe('official Claude SDK through the user CLI process', () => {
         void adapter.respond(event.sessionId, event.requestId!, { answers: { 0: ['JSON'] } })
     })
     try {
-      await adapter.send(context, 'Hello', 'app-turn')
+      await adapter.send(
+        {
+          ...context,
+          input: {
+            text: 'Hello',
+            context: [
+              {
+                id: 'image',
+                kind: 'image',
+                name: 'sample.png',
+                dataUrl: 'data:image/png;base64,aGVsbG8=',
+              },
+            ],
+          },
+        },
+        'Hello',
+        'app-turn',
+      )
       await vi.waitFor(() => expect(events.some((event) => event.kind === 'done')).toBe(true), {
         timeout: 5000,
       })

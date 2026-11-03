@@ -4,12 +4,38 @@ import { access, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import crossSpawn from 'cross-spawn'
+import { randomUUID } from 'node:crypto'
+import {
+  acquireWindowsProcess,
+  ensureWindowsProcessApi,
+  openVerifiedWindowsProcess,
+  type WindowsProcessLease,
+} from './windows-process'
 
 let environment: NodeJS.ProcessEnv = { ...process.env }
 let prepared: Promise<NodeJS.ProcessEnv> | undefined
 let shuttingDown = false
 const ownedChildren = new Map<ChildProcessWithoutNullStreams, OwnedProcessTree>()
 const ownedTrees = new Set<OwnedProcessTree>()
+export interface ProcessOwnership {
+  id: string
+  pid: number
+  started: string
+  isolatedGroup: boolean
+  members?: { pid: number; started: string }[]
+  /** Observed late processes whose ownership is unproven: block, never auto-kill. */
+  uncertainMembers?: { pid: number; started: string }[]
+}
+export interface ProcessOwnershipEvent {
+  action: 'register' | 'release'
+  process: ProcessOwnership
+}
+let ownershipObserver: ((event: ProcessOwnershipEvent) => void) | undefined
+export function setProcessOwnershipObserver(
+  observer: (event: ProcessOwnershipEvent) => void,
+): void {
+  ownershipObserver = observer
+}
 
 interface ProcessIdentity {
   pid: number
@@ -23,7 +49,149 @@ export interface OwnedProcessTree {
   release(): void
 }
 
-async function processSnapshot(): Promise<ProcessIdentity[]> {
+interface WindowsSnapshotWorker {
+  child: ChildProcessWithoutNullStreams
+  pending?: {
+    resolve(value: ProcessIdentity[]): void
+    reject(error: Error): void
+    timer: ReturnType<typeof setTimeout>
+  }
+}
+let windowsSnapshotWorker: WindowsSnapshotWorker | undefined
+
+function closeSnapshotWorker(error = new Error('Process snapshot worker closed')): void {
+  const worker = windowsSnapshotWorker
+  if (!worker) return
+  windowsSnapshotWorker = undefined
+  if (worker.pending) {
+    clearTimeout(worker.pending.timer)
+    worker.pending.reject(error)
+    worker.pending = undefined
+  }
+  // This is the exact child handle created below, never a caller-supplied PID.
+  worker.child.stdin.end()
+  worker.child.kill()
+}
+
+function readWindowsSnapshot(): Promise<ProcessIdentity[]> {
+  let worker = windowsSnapshotWorker
+  if (!worker) {
+    const command = path.join(
+      process.env.SystemRoot || 'C:\\Windows',
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe',
+    )
+    // One fixed read-only protocol avoids starting PowerShell several times for
+    // every short Git command. EOF exits the helper after a runtime/main crash.
+    // The input is a literal marker, never executable script or a user command.
+    const script = `
+      $ErrorActionPreference='Stop';
+      [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);
+      while ($null -ne ($request=[Console]::ReadLine())) {
+        if ($request -ne 'snapshot') { exit 1 };
+        $result=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Where-Object { $_.ProcessId -gt 0 -and $_.CreationDate } | ForEach-Object { [pscustomobject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().Ticks.ToString()} });
+        [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($result) -Compress));
+        [Console]::Out.Flush();
+      }
+    `
+    const child = spawn(command, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      stdio: 'pipe',
+      windowsHide: true,
+      shell: false,
+    }) as ChildProcessWithoutNullStreams
+    worker = { child }
+    windowsSnapshotWorker = worker
+    const connection = worker
+    let output = ''
+    const fail = (error: Error): void => {
+      if (windowsSnapshotWorker === connection) closeSnapshotWorker(error)
+    }
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      output += chunk
+      if (Buffer.byteLength(output) > 8 * 1024 * 1024) {
+        fail(new Error('Process snapshot exceeds the 8 MB limit'))
+        return
+      }
+      let newline: number
+      while ((newline = output.indexOf('\n')) >= 0) {
+        const line = output
+          .slice(0, newline)
+          .replace(/^\uFEFF/, '')
+          .trim()
+        output = output.slice(newline + 1)
+        if (!line) continue
+        const pending = connection.pending
+        if (!pending) {
+          fail(new Error('Unexpected process snapshot response'))
+          return
+        }
+        try {
+          const parsed: unknown = JSON.parse(line)
+          if (!Array.isArray(parsed)) throw new Error('Invalid process snapshot response')
+          const snapshot: ProcessIdentity[] = parsed.map((entry) => {
+            if (
+              !entry ||
+              !Number.isSafeInteger(entry.pid) ||
+              entry.pid < 1 ||
+              entry.pid > 0xffffffff ||
+              !Number.isSafeInteger(entry.parent) ||
+              entry.parent < 0 ||
+              entry.parent > 0xffffffff ||
+              typeof entry.started !== 'string' ||
+              !/^[1-9]\d{0,18}$/.test(entry.started) ||
+              BigInt(entry.started) > 3155378975999999999n
+            )
+              throw new Error('Invalid process snapshot identity')
+            return {
+              pid: entry.pid,
+              parent: entry.parent,
+              started: entry.started,
+              group: entry.pid,
+              state: '',
+            }
+          })
+          clearTimeout(pending.timer)
+          connection.pending = undefined
+          pending.resolve(snapshot)
+        } catch {
+          fail(new Error('Unable to decode process snapshot'))
+          return
+        }
+      }
+    })
+    // Drain diagnostic output without logging process arguments or environment.
+    child.stdout.on('error', () => fail(new Error('Process snapshot output closed')))
+    child.stdout.once('end', () => fail(new Error('Process snapshot output closed')))
+    child.stderr.on('error', () => fail(new Error('Process snapshot diagnostics closed')))
+    child.stderr.resume()
+    child.stdin.on('error', () => fail(new Error('Process snapshot input closed')))
+    child.once('error', () => fail(new Error('Unable to start process snapshot worker')))
+    child.once('close', () => fail(new Error('Process snapshot worker exited')))
+    // An idle inspector must not keep an otherwise exiting Node runtime alive.
+    // Each pending request's referenced timer keeps active work alive instead.
+    child.unref()
+    for (const stream of [child.stdin, child.stdout, child.stderr])
+      (stream as typeof stream & { unref?: () => void }).unref?.()
+  }
+  const connection = worker
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (windowsSnapshotWorker === connection)
+        closeSnapshotWorker(new Error('Process snapshot timed out'))
+    }, 5000)
+    connection.pending = { resolve, reject, timer }
+    connection.child.stdin.write('snapshot\n', (error) => {
+      if (error && windowsSnapshotWorker === connection)
+        closeSnapshotWorker(new Error('Unable to request process snapshot'))
+    })
+  })
+}
+
+async function readProcessSnapshot(): Promise<ProcessIdentity[]> {
+  if (process.platform === 'win32') return readWindowsSnapshot()
   return new Promise((resolve, reject) => {
     execFile(
       '/bin/ps',
@@ -55,6 +223,53 @@ async function processSnapshot(): Promise<ProcessIdentity[]> {
   })
 }
 
+// Only calls collected before a scan starts may share that scan. A request made
+// while a scan is running queues a fresh one: newly spawned/late descendants and
+// post-termination verification must never receive an older cached snapshot.
+let snapshotInFlight = false
+let snapshotClosed = false
+let snapshotQueued:
+  | {
+      promise: Promise<ProcessIdentity[]>
+      resolve(value: ProcessIdentity[]): void
+      reject(error: unknown): void
+    }
+  | undefined
+async function drainSnapshotQueue(): Promise<void> {
+  if (snapshotClosed) {
+    snapshotQueued?.reject(new Error('The process inspector is shutting down'))
+    snapshotQueued = undefined
+    return
+  }
+  if (snapshotInFlight || !snapshotQueued) return
+  const batch = snapshotQueued
+  snapshotQueued = undefined
+  snapshotInFlight = true
+  try {
+    batch.resolve(await readProcessSnapshot())
+  } catch (error) {
+    batch.reject(error)
+  } finally {
+    snapshotInFlight = false
+    if (snapshotQueued) queueMicrotask(() => void drainSnapshotQueue())
+  }
+}
+function processSnapshot(): Promise<ProcessIdentity[]> {
+  if (process.platform !== 'win32') return readProcessSnapshot()
+  if (snapshotClosed) return Promise.reject(new Error('The process inspector is shutting down'))
+  if (!snapshotQueued) {
+    let resolveBatch!: (value: ProcessIdentity[]) => void
+    let rejectBatch!: (error: unknown) => void
+    const promise = new Promise<ProcessIdentity[]>((resolve, reject) => {
+      resolveBatch = resolve
+      rejectBatch = reject
+    })
+    snapshotQueued = { promise, resolve: resolveBatch, reject: rejectBatch }
+  }
+  if (!snapshotInFlight) queueMicrotask(() => void drainSnapshotQueue())
+  return snapshotQueued.promise
+}
+
 function descendantProcesses(
   snapshot: ProcessIdentity[],
   root: number,
@@ -79,81 +294,507 @@ function signalOwnedProcess(entry: ProcessIdentity, signal: NodeJS.Signals): voi
   }
 }
 
-/** Only call for a process just created by this application; never accept renderer-supplied PIDs. */
-export function ownProcessTree(
+function uncertainWindowsProcessAlive(pid: number, started: string): boolean {
+  const lease = openVerifiedWindowsProcess(pid, started)
+  if (!lease) return false
+  try {
+    return lease.isAlive()
+  } finally {
+    lease.close()
+  }
+}
+
+/** Windows PIDs stay reserved while these native process-object handles remain open. */
+function ownWindowsProcessTree(
   pid: number,
   isRunning: () => boolean,
-  isolatedGroup = false,
+  expectedStarted: string | undefined,
+  expectedMembers: { pid: number; started: string }[],
 ): OwnedProcessTree {
-  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid)
-    throw new Error('Invalid owned process')
+  const local = expectedStarted === undefined
+  let rootStarted = expectedStarted
   let released = false
+  let cleanupUnconfirmed = true
   let pending: Promise<void> | undefined
+  let captureError: unknown
+  let capturedRoot = false
+  let identity: ProcessOwnership | undefined
+  let published = ''
+  const known = new Map(
+    expectedMembers
+      .filter(
+        (member) => member.pid !== pid || (expectedStarted && member.started === expectedStarted),
+      )
+      .map((member) => [member.pid, member.started]),
+  )
+  const leases = new Map<number, WindowsProcessLease>()
+  const uncertain = new Map<number, string>()
+  const uncertainHistory = new Map<number, string>()
+  const publish = (): void => {
+    if (released || (!known.size && !uncertain.size)) return
+    const data = {
+      pid,
+      started: rootStarted ?? '',
+      isolatedGroup: false,
+      members: [...known].map(([pid, started]) => ({ pid, started })),
+      ...(uncertain.size
+        ? { uncertainMembers: [...uncertain].map(([pid, started]) => ({ pid, started })) }
+        : {}),
+    }
+    const signature = JSON.stringify(data)
+    if (signature === published) return
+    published = signature
+    identity = { id: identity?.id ?? randomUUID(), ...data }
+    ownershipObserver?.({ action: 'register', process: identity })
+  }
+  try {
+    // Only a synchronous, still-owned launch may establish a new root identity.
+    // Recovery must supply its previously recorded birth and verify it natively.
+    const root = local
+      ? isRunning()
+        ? acquireWindowsProcess(pid)
+        : undefined
+      : expectedStarted
+        ? openVerifiedWindowsProcess(pid, expectedStarted)
+        : undefined
+    if (root) {
+      capturedRoot = true
+      rootStarted = root.started
+      known.set(pid, root.started)
+      leases.set(pid, root)
+    }
+    for (const [memberPid, started] of known) {
+      if (memberPid === process.pid || memberPid <= 1 || leases.has(memberPid)) continue
+      const member = openVerifiedWindowsProcess(memberPid, started)
+      if (member) leases.set(memberPid, member)
+    }
+  } catch (error) {
+    captureError = error
+  }
+  publish()
+  const observe = (snapshot: ProcessIdentity[]): number => {
+    const before = known.size
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const entry of snapshot) {
+        if (
+          entry.pid <= 1 ||
+          entry.pid === process.pid ||
+          leases.has(entry.pid) ||
+          uncertainHistory.get(entry.pid) === entry.started
+        )
+          continue
+        const parent = leases.get(entry.parent)
+        // A pinned parent cannot be recycled, even after it exits. Birth order
+        // rejects stale ParentProcessId links to processes older than that parent.
+        if (!parent || BigInt(entry.started) < BigInt(parent.started)) continue
+        const candidate = acquireWindowsProcess(entry.pid)
+        if (!candidate) continue
+        if (candidate.started !== entry.started) {
+          // The enumerated PID changed before native acquisition. Its old PPID
+          // cannot establish the new object's ancestry. Older objects are foreign;
+          // otherwise retain uncertainty without ever sending a termination.
+          if (BigInt(candidate.started) >= BigInt(parent.started)) {
+            uncertain.set(candidate.pid, candidate.started)
+            uncertainHistory.set(candidate.pid, candidate.started)
+          }
+          candidate.close()
+          continue
+        }
+        leases.set(entry.pid, candidate)
+        known.set(entry.pid, candidate.started)
+        changed = true
+      }
+    }
+    // A numeric parent without a pinned identity is evidence of uncertainty,
+    // never permission to adopt or terminate that process (including a root PID).
+    const candidates = new Map<number, string>()
+    const unpinned = new Map<number, string | undefined>()
+    for (const [memberPid, started] of uncertainHistory) {
+      const current = snapshot.find((entry) => entry.pid === memberPid)
+      if (!current || current.started === started) unpinned.set(memberPid, started)
+    }
+    for (const [memberPid, started] of known) {
+      const current = snapshot.find((entry) => entry.pid === memberPid)
+      if (!leases.has(memberPid) && (!current || current.started === started))
+        unpinned.set(memberPid, started)
+    }
+    if (!leases.has(pid)) {
+      const current = snapshot.find((entry) => entry.pid === pid)
+      if (!rootStarted || !current || current.started === rootStarted)
+        unpinned.set(pid, rootStarted)
+      if (local && !rootStarted && current) candidates.set(current.pid, current.started)
+    }
+    changed = true
+    while (changed) {
+      changed = false
+      for (const entry of snapshot) {
+        if (entry.pid <= 1 || entry.pid === process.pid || leases.has(entry.pid)) continue
+        const parentBirth = unpinned.get(entry.parent)
+        if (
+          !unpinned.has(entry.parent) ||
+          (parentBirth && BigInt(entry.started) < BigInt(parentBirth)) ||
+          candidates.has(entry.pid)
+        )
+          continue
+        candidates.set(entry.pid, entry.started)
+        unpinned.set(entry.pid, entry.started)
+        changed = true
+      }
+    }
+    for (const [candidatePid, started] of candidates) {
+      uncertain.set(candidatePid, started)
+      uncertainHistory.set(candidatePid, started)
+    }
+    publish()
+    return known.size - before
+  }
+  const initial = processSnapshot()
+    .then(observe)
+    .catch(() => {})
   const tree: OwnedProcessTree = {
     release() {
+      if (released || cleanupUnconfirmed || uncertain.size) return
+      // A failed CloseHandle must retain ownership and allow a later retry.
+      for (const [memberPid, lease] of leases) {
+        lease.close()
+        leases.delete(memberPid)
+      }
       released = true
       ownedTrees.delete(tree)
+      if (identity) ownershipObserver?.({ action: 'release', process: identity })
     },
-    terminate(force = false) {
+    terminate() {
       if (pending) return pending
-      if (released || !isRunning()) {
-        tree.release()
-        return Promise.resolve()
-      }
+      if (released) return Promise.resolve()
       pending = (async () => {
-        if (process.platform === 'win32') {
-          // taskkill follows this application's live root, never an image-name pattern.
-          const command = path.join(
-            process.env.SystemRoot || 'C:\\Windows',
-            'System32',
-            'taskkill.exe',
-          )
-          await new Promise<void>((resolve, reject) => {
-            const taskkill = spawn(command, ['/PID', String(pid), '/T', '/F'], {
-              windowsHide: true,
-              stdio: 'ignore',
-              shell: false,
-            })
-            const timer = setTimeout(() => {
-              taskkill.kill()
-              reject(new Error('Process tree termination timed out'))
-            }, 4000)
-            taskkill.once('error', (error) => {
-              clearTimeout(timer)
-              reject(error)
-            })
-            taskkill.once('close', (code) => {
-              clearTimeout(timer)
-              if (code === 0 || !isRunning()) resolve()
-              else reject(new Error(`Unable to terminate owned process tree (${code})`))
-            })
-          })
-          return
-        }
+        await initial
         const snapshot = await processSnapshot()
-        // The ownership callback prevents acting on a PID that has already been reaped/reused.
-        if (!isRunning()) return
-        const root = snapshot.find((entry) => entry.pid === pid)
-        if (!root) return
-        const targets = descendantProcesses(snapshot, pid, isolatedGroup)
-        // Capture descendants before terminating the parent, since orphaned children are reparented.
-        for (const entry of targets.filter((entry) => entry.pid !== pid))
-          signalOwnedProcess(entry, force ? 'SIGKILL' : 'SIGTERM')
-        signalOwnedProcess(root, force ? 'SIGKILL' : 'SIGTERM')
-        if (force) return
-        await new Promise((resolve) => setTimeout(resolve, 600))
-        const remaining = new Map((await processSnapshot()).map((entry) => [entry.pid, entry]))
-        for (const before of targets) {
-          const after = remaining.get(before.pid)
-          // Never signal a recycled PID: the start identity must still match the captured descendant.
-          if (after && after.started === before.started) signalOwnedProcess(after, 'SIGKILL')
+        for (const [memberPid, started] of uncertain) {
+          if (!uncertainWindowsProcessAlive(memberPid, started)) uncertain.delete(memberPid)
         }
-      })().finally(() => tree.release())
+        observe(snapshot)
+        if (uncertain.size)
+          throw new Error('Cannot verify process descendants. Ownership was retained.')
+        if (captureError) throw captureError
+        if (local && !capturedRoot && isRunning())
+          throw new Error('Cannot verify the launched process identity. Ownership was retained.')
+        // Each lease is a process object, not a numeric PID kill. Never delegate
+        // tree traversal to taskkill /T, which can exceed this verified set.
+        const targets = [...leases.values()]
+        const deadline = Date.now() + 4000
+        for (const target of targets.reverse()) {
+          if (!target.isAlive()) continue
+          const fresh = await processSnapshot()
+          const added = observe(fresh)
+          if (uncertain.size || added)
+            throw new Error(
+              'New descendants require another confirmed cleanup. Ownership was retained.',
+            )
+          if (target.isAlive()) await target.terminate(deadline)
+        }
+        while ([...leases.values()].some((lease) => lease.isAlive())) {
+          if (Date.now() >= deadline)
+            throw new Error('Owned processes did not stop. Ownership was retained.')
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        const after = await processSnapshot()
+        const added = observe(after)
+        if (uncertain.size || added || [...leases.values()].some((lease) => lease.isAlive()))
+          throw new Error(
+            'New descendants require another confirmed cleanup. Ownership was retained.',
+          )
+      })().then(
+        () => {
+          cleanupUnconfirmed = false
+          try {
+            tree.release()
+          } catch (error) {
+            cleanupUnconfirmed = true
+            pending = undefined
+            throw error
+          }
+        },
+        (error) => {
+          pending = undefined
+          throw error
+        },
+      )
       return pending
     },
   }
   ownedTrees.add(tree)
   return tree
+}
+
+/** Only call for processes created by this application; renderer-supplied PIDs are forbidden. */
+export function ownProcessTree(
+  pid: number,
+  isRunning: () => boolean,
+  isolatedGroup = false,
+  expectedStarted?: string,
+  expectedMembers: { pid: number; started: string }[] = [],
+): OwnedProcessTree {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid)
+    throw new Error('Invalid owned process')
+  if (process.platform === 'win32')
+    return ownWindowsProcessTree(pid, isRunning, expectedStarted, expectedMembers)
+  let released = false
+  let cleanupUnconfirmed = true
+  let pending: Promise<void> | undefined
+  let identity: ProcessOwnership | undefined
+  let rootStarted = expectedStarted
+  const known = new Map(
+    expectedMembers
+      .filter((member) => member.pid !== pid || member.started === expectedStarted)
+      .map((member) => [member.pid, member.started]),
+  )
+  const unverifiedLate = new Map<number, string>()
+  const local = expectedStarted === undefined
+  const publish = (): void => {
+    if (released || (!known.size && !unverifiedLate.size)) return
+    identity = {
+      id: identity?.id ?? randomUUID(),
+      pid,
+      started: rootStarted ?? '',
+      isolatedGroup,
+      members: [...known].map(([pid, started]) => ({ pid, started })),
+      ...(unverifiedLate.size
+        ? { uncertainMembers: [...unverifiedLate].map(([pid, started]) => ({ pid, started })) }
+        : {}),
+    }
+    ownershipObserver?.({ action: 'register', process: identity })
+  }
+  const remember = (targets: ProcessIdentity[], root?: ProcessIdentity): void => {
+    if (root) rootStarted = root.started
+    for (const target of targets) known.set(target.pid, target.started)
+    if (targets.length) publish()
+  }
+  const initial = local
+    ? processSnapshot()
+        .then((snapshot) => {
+          const root = snapshot.find((entry) => entry.pid === pid)
+          const targets = descendantProcesses(snapshot, pid, isolatedGroup)
+          remember(targets, root)
+        })
+        .catch(() => {})
+    : Promise.resolve()
+  const tree: OwnedProcessTree = {
+    release() {
+      if (released || cleanupUnconfirmed || unverifiedLate.size) return
+      released = true
+      ownedTrees.delete(tree)
+      if (identity) ownershipObserver?.({ action: 'release', process: identity })
+    },
+    terminate(force = false) {
+      if (pending) return pending
+      if (released) return Promise.resolve()
+      pending = (async () => {
+        await initial
+        const snapshot = await processSnapshot()
+        for (const [latePid, started] of unverifiedLate) {
+          if (snapshot.some((entry) => entry.pid === latePid && entry.started === started))
+            throw new Error('Cannot verify late process descendants. Ownership was retained.')
+          unverifiedLate.delete(latePid)
+        }
+        const root = snapshot.find((entry) => entry.pid === pid)
+        const rootMatches = root && (rootStarted ? root.started === rootStarted : isRunning())
+        const knownTargets = snapshot.filter((entry) => known.get(entry.pid) === entry.started)
+        let targets: ProcessIdentity[]
+        if (rootMatches) targets = descendantProcesses(snapshot, pid, isolatedGroup)
+        else if (local && !root && isolatedGroup && process.platform !== 'win32') {
+          // A live POSIX process group reserves its ID even after its leader exits.
+          targets = descendantProcesses(snapshot, pid, true)
+        } else targets = knownTargets
+        if (!local && !rootMatches && !knownTargets.length) {
+          if (root) return // A recycled leader PID must never be targeted.
+          if (isolatedGroup && snapshot.some((entry) => entry.group === pid))
+            throw new Error(
+              'Cannot verify the remaining process group identity. Ownership was retained.',
+            )
+          return
+        }
+        targets = [
+          ...new Map([...targets, ...knownTargets].map((entry) => [entry.pid, entry])).values(),
+        ].filter((entry) => entry.pid !== process.pid && !entry.state.startsWith('Z'))
+        remember(targets, rootMatches ? root : undefined)
+        if (!targets.length) return
+        const rejectLateDescendants = (current: ProcessIdentity[]): void => {
+          const leader = current.find((entry) => entry.pid === pid)
+          const originalRoot = !leader || !rootStarted || leader.started === rootStarted
+          const anchors = [...known].flatMap(([knownPid, started]) => {
+            const member = current.find((entry) => entry.pid === knownPid)
+            return !member || member.started === started ? [knownPid] : []
+          })
+          if (originalRoot) anchors.push(pid)
+          const candidates = new Map<number, ProcessIdentity>()
+          for (const anchor of new Set(anchors))
+            for (const entry of descendantProcesses(
+              current,
+              anchor,
+              originalRoot && anchor === pid && isolatedGroup,
+            ))
+              if (entry.pid !== process.pid && !entry.state.startsWith('Z'))
+                candidates.set(entry.pid, entry)
+          const late = [...candidates.values()].filter(
+            (entry) =>
+              !targets.some(
+                (target) => target.pid === entry.pid && target.started === entry.started,
+              ),
+          )
+          if (!late.length) return
+          const proven = new Map(known)
+          const verified: ProcessIdentity[] = []
+          let changed = true
+          while (changed) {
+            changed = false
+            for (const entry of late) {
+              if (proven.get(entry.pid) === entry.started) continue
+              const parent = current.find((parent) => parent.pid === entry.parent)
+              if (
+                (originalRoot && isolatedGroup && entry.group === pid) ||
+                (parent && proven.get(parent.pid) === parent.started)
+              ) {
+                proven.set(entry.pid, entry.started)
+                verified.push(entry)
+                changed = true
+              }
+            }
+          }
+          for (const entry of late)
+            if (proven.get(entry.pid) !== entry.started)
+              unverifiedLate.set(entry.pid, entry.started)
+          for (const entry of verified) known.set(entry.pid, entry.started)
+          publish()
+          throw new Error(
+            'New descendants require another confirmed cleanup. Ownership was retained.',
+          )
+        }
+        for (const target of targets.filter((entry) => entry.pid !== pid))
+          signalOwnedProcess(target, force ? 'SIGKILL' : 'SIGTERM')
+        const leader = targets.find((entry) => entry.pid === pid)
+        if (leader) signalOwnedProcess(leader, force ? 'SIGKILL' : 'SIGTERM')
+        if (!force) await new Promise((resolve) => setTimeout(resolve, 600))
+        const remaining = new Map((await processSnapshot()).map((entry) => [entry.pid, entry]))
+        for (const before of targets) {
+          const after = remaining.get(before.pid)
+          if (after && after.started === before.started) signalOwnedProcess(after, 'SIGKILL')
+        }
+        await new Promise((resolve) => setTimeout(resolve, 80))
+        const after = await processSnapshot()
+        rejectLateDescendants(after)
+        if (
+          targets.some((target) =>
+            after.some(
+              (entry) =>
+                entry.pid === target.pid &&
+                entry.started === target.started &&
+                !entry.state.startsWith('Z'),
+            ),
+          )
+        )
+          throw new Error('Owned processes did not stop. Ownership was retained.')
+      })().then(
+        () => {
+          cleanupUnconfirmed = false
+          tree.release()
+        },
+        (error) => {
+          pending = undefined
+          throw error
+        },
+      )
+      return pending
+    },
+  }
+  ownedTrees.add(tree)
+  return tree
+}
+
+/** Main-process recovery uses only runtime-issued ownership records, never renderer PIDs. */
+export async function terminateOwnedProcesses(records: ProcessOwnership[]): Promise<void> {
+  if (!records.length) return
+  const snapshot = await processSnapshot()
+  const failures: unknown[] = []
+  await Promise.all(
+    records.map(async (record) => {
+      if (
+        record.uncertainMembers?.some((member) => {
+          if (
+            process.platform === 'win32' &&
+            uncertainWindowsProcessAlive(member.pid, member.started)
+          )
+            return true
+          const current = snapshot.find((entry) => entry.pid === member.pid)
+          if (current) return current.started === member.started
+          const suspected = new Map([[member.pid, member.started]])
+          let changed = true
+          while (changed) {
+            changed = false
+            for (const entry of snapshot) {
+              const parentBirth = suspected.get(entry.parent)
+              if (
+                parentBirth &&
+                !suspected.has(entry.pid) &&
+                (process.platform !== 'win32' || BigInt(entry.started) >= BigInt(parentBirth))
+              ) {
+                suspected.set(entry.pid, entry.started)
+                changed = true
+              }
+            }
+          }
+          return suspected.size > 1
+        })
+      ) {
+        failures.push(new Error('Cannot verify late process descendants. Ownership was retained.'))
+        return
+      }
+      const root = snapshot.find(
+        (entry) => entry.pid === record.pid && entry.started === record.started,
+      )
+      const members = (record.members ?? []).filter(
+        (member) => member.pid !== record.pid || member.started === record.started,
+      )
+      const knownMember = snapshot.some((entry) =>
+        members.some((member) => member.pid === entry.pid && member.started === entry.started),
+      )
+      if (
+        !root &&
+        !knownMember &&
+        process.platform === 'win32' &&
+        !snapshot.some((entry) => entry.pid === record.pid) &&
+        snapshot.some((entry) => entry.parent === record.pid)
+      ) {
+        failures.push(
+          new Error(
+            'Cannot verify Windows descendants after the owning parent exited. Ownership was retained.',
+          ),
+        )
+        return
+      }
+      if (
+        !root &&
+        !knownMember &&
+        !snapshot.some((entry) => record.isolatedGroup && entry.group === record.pid)
+      )
+        return
+      try {
+        const tree = ownProcessTree(
+          record.pid,
+          () => Boolean(root),
+          record.isolatedGroup,
+          record.started,
+          members,
+        )
+        await tree.terminate()
+      } catch (error) {
+        failures.push(error)
+      }
+    }),
+  )
+  if (failures.length)
+    throw new Error(`Unable to terminate ${failures.length} owned process tree(s).`)
 }
 
 export async function terminateProcessTree(
@@ -168,9 +809,20 @@ export async function terminateProcessTree(
   await tree.terminate(force)
 }
 
+/** Confirm cleanup after a natural parent exit, including children holding inherited pipes. */
+export async function finalizeOwnedChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  await terminateProcessTree(child)
+}
+
 export async function closeAllProcesses(): Promise<void> {
   shuttingDown = true
   await Promise.allSettled([...ownedTrees].map((tree) => tree.terminate()))
+  // Termination above still needs fresh scans. Close the queue only after it
+  // finishes, including initial ownership scans whose trees were released early.
+  snapshotClosed = true
+  snapshotQueued?.reject(new Error('The process inspector is shutting down'))
+  snapshotQueued = undefined
+  closeSnapshotWorker()
 }
 
 /** Finder does not inherit the PATH established by the user's login shell. */
@@ -272,6 +924,7 @@ export function launch(
   if ([command, ...args].some((value) => value.includes('\0')))
     throw new Error('Command contains an invalid NUL character')
   const childEnv = getProcessEnvironment(env)
+  if (process.platform === 'win32') ensureWindowsProcessApi()
   const child = crossSpawn(command, args, {
     cwd,
     env: childEnv,
@@ -287,9 +940,12 @@ export function launch(
       process.platform !== 'win32',
     )
     ownedChildren.set(child, tree)
-    child.once('close', () => {
-      tree.release()
-      ownedChildren.delete(child)
+    child.once('exit', () => {
+      // Descendants may inherit stdout: waiting for close can deadlock forever.
+      void tree.terminate().then(
+        () => ownedChildren.delete(child),
+        () => {},
+      )
     })
   }
   return child
@@ -306,9 +962,10 @@ export async function runCommand(
   command: string,
   args: string[],
   cwd?: string,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<CommandResult> {
   await prepareEnvironment()
+  if (options.signal?.aborted) throw new Error('Command cancelled')
   return new Promise((resolve, reject) => {
     const child = launch(command, args, cwd)
     const stdout: Buffer[] = []
@@ -316,26 +973,40 @@ export async function runCommand(
     let total = 0
     let failure: Error | undefined
     let cleanup: Promise<void> | undefined
+    const stop = (error: Error, force = false): void => {
+      failure = error
+      if (!cleanup) {
+        cleanup = terminateProcessTree(child, force)
+        void cleanup.catch(reject)
+      }
+    }
+    const abort = (): void => stop(new Error('Command cancelled'))
+    options.signal?.addEventListener('abort', abort, { once: true })
     const timer = setTimeout(() => {
-      failure = new Error(`Command timed out: ${path.basename(command)}`)
-      cleanup = terminateProcessTree(child).catch(() => {})
+      stop(new Error(`Command timed out: ${path.basename(command)}`))
     }, options.timeoutMs ?? 30_000)
     const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
       total += chunk.length
       if (total > 8 * 1024 * 1024) {
-        failure = new Error('Command output exceeds the 8 MB limit')
-        cleanup ||= terminateProcessTree(child, true).catch(() => {})
+        stop(new Error('Command output exceeds the 8 MB limit'), true)
       } else chunks.push(chunk)
     }
     child.stdout.on('data', collect(stdout))
     child.stderr.on('data', collect(stderr))
     child.once('error', (error) => {
       clearTimeout(timer)
+      options.signal?.removeEventListener('abort', abort)
       reject(error)
     })
     child.once('close', async (code) => {
       clearTimeout(timer)
-      await cleanup
+      options.signal?.removeEventListener('abort', abort)
+      try {
+        await (cleanup ?? finalizeOwnedChild(child))
+      } catch (error) {
+        reject(error)
+        return
+      }
       if (failure) {
         reject(failure)
         return
@@ -349,5 +1020,6 @@ export async function runCommand(
       })
     })
     child.stdin.end()
+    if (options.signal?.aborted) abort()
   })
 }

@@ -1,0 +1,61 @@
+name: Signed release candidates
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release:
+    environment: production-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            feed: MAC_X64_UPDATE_URL
+            certificate: MAC_CSC_LINK
+            password: MAC_CSC_KEY_PASSWORD
+          - os: macos-15
+            feed: MAC_ARM64_UPDATE_URL
+            certificate: MAC_CSC_LINK
+            password: MAC_CSC_KEY_PASSWORD
+          - os: windows-latest
+            feed: WIN_X64_UPDATE_URL
+            certificate: WIN_CSC_LINK
+            password: WIN_CSC_KEY_PASSWORD
+    runs-on: ${{ matrix.os }}
+    env:
+      CODING_HUB_UPDATE_URL: ${{ vars[matrix.feed] }}
+      CSC_LINK: ${{ secrets[matrix.certificate] }}
+      CSC_KEY_PASSWORD: ${{ secrets[matrix.password] }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm test
+      - run: pnpm release:mac
+        if: runner.os == 'macOS'
+      - run: pnpm release:win
+        if: runner.os == 'Windows'
+      - run: node scripts/packaged-e2e.mjs
+      - run: node scripts/checksums.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-candidate-${{ matrix.os }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.yml
+            release/*.blockmap
+            release/SHA256SUMS.txt
+          retention-days: 30

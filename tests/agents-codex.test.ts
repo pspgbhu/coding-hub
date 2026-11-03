@@ -3,13 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentContext } from '../src/shared/runtime'
 import type { AgentEvent } from '../src/shared/types'
 
-const fixtures = vi.hoisted(() => ({ script: '' }))
+const fixtures = vi.hoisted(() => ({ script: '', cleanupFails: false }))
 vi.mock('../src/runtime/process', () => ({
   resolveCommand: async () => process.execPath,
   launch: () => spawn(process.execPath, ['-e', fixtures.script], { stdio: 'pipe' }),
   terminateProcessTree: async (child: ReturnType<typeof spawn>) => {
+    if (fixtures.cleanupFails) throw new Error('Fixture process cleanup failed')
     child.kill()
   },
+  finalizeOwnedChild: async () => {},
 }))
 import { CodexAdapter, CodexRpc } from '../src/runtime/adapters/codex'
 
@@ -28,10 +30,104 @@ const context: AgentContext = {
 }
 const children: ReturnType<typeof spawn>[] = []
 afterEach(() => {
+  fixtures.cleanupFails = false
   for (const child of children.splice(0)) child.kill()
 })
 
 describe('Codex public app-server protocol', () => {
+  it('keeps a protocol-failed turn locked when child cleanup cannot be confirmed', async () => {
+    fixtures.script = `const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');rl.on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')send({id:m.id,result:{}});if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'broken'}}});if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'broken-turn'}}});process.stdout.write('{invalid-json}\\n')}})`
+    const events: AgentEvent[] = []
+    const adapter = new CodexAdapter((event) => events.push(event))
+    fixtures.cleanupFails = true
+    try {
+      await adapter.send(context, 'Work', 'broken')
+      await vi.waitFor(() =>
+        expect(events.at(-1)).toMatchObject({ kind: 'status', status: 'stop_failed' }),
+      )
+      expect(events.some((event) => event.kind === 'done')).toBe(false)
+      await expect(adapter.send(context, 'Other work', 'other')).rejects.toThrow('already running')
+      fixtures.cleanupFails = false
+      await adapter.interrupt(context.session.id)
+      expect(events.at(-1)).toMatchObject({ kind: 'done', status: 'interrupted' })
+    } finally {
+      fixtures.cleanupFails = false
+      await adapter.close()
+    }
+  })
+  it('forwards original long tool chunks and complete snapshots without truncation', async () => {
+    fixtures.script = `
+      const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+      rl.on('line',line=>{const m=JSON.parse(line);
+        if(m.method==='initialize')send({id:m.id,result:{}});
+        if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'long-thread'}}});
+        if(m.method==='turn/start'){
+          send({id:m.id,result:{turn:{id:'long-turn'}}});
+          send({method:'item/commandExecution/outputDelta',params:{threadId:'long-thread',itemId:'command',delta:'x'.repeat(90000)}});
+          send({method:'item/completed',params:{threadId:'long-thread',item:{id:'command',type:'commandExecution',aggregatedOutput:'x'.repeat(90000),status:'completed'}}});
+          send({method:'turn/completed',params:{threadId:'long-thread',turn:{id:'long-turn',status:'completed'}}});
+        }
+      });
+    `
+    const events: AgentEvent[] = []
+    const adapter = new CodexAdapter((event) => events.push(event))
+    await adapter.send(context, 'Run', 'long')
+    await vi.waitFor(() => expect(events.some((event) => event.kind === 'done')).toBe(true))
+    expect(events.find((event) => event.outputDelta)?.output).toHaveLength(90000)
+    expect(
+      events.find((event) => event.kind === 'tool' && event.state === 'completed'),
+    ).toMatchObject({ outputDelta: false, output: 'x'.repeat(90000) })
+    await adapter.close()
+  })
+  it('presents permission profiles, transmits native images, and records the selected scope', async () => {
+    fixtures.script = `
+      const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+      rl.on('line',line=>{const m=JSON.parse(line);
+        if(m.method==='initialize')send({id:m.id,result:{}});
+        if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'profile-thread'}}});
+        if(m.method==='turn/start'){
+          if(m.params.input[1].type!=='image'||!m.params.input[1].url.startsWith('data:image/png;base64,'))process.exit(8);
+          send({id:m.id,result:{turn:{id:'profile-turn'}}});
+          send({id:10,method:'item/permissions/requestApproval',params:{permissions:{network:{enabled:true}}}});
+        }
+        if(m.id===10){
+          if(m.result.permissions.network.enabled!==true||m.result.scope!=='session')process.exit(9);
+          send({method:'turn/completed',params:{threadId:'profile-thread',turn:{id:'profile-turn',status:'completed'}}});
+        }
+      });
+    `
+    const events: AgentEvent[] = []
+    const adapter = new CodexAdapter((event) => {
+      events.push(event)
+      if (event.kind === 'approval')
+        void adapter.respond('session', event.requestId!, { decision: 'accept', scope: 'session' })
+    })
+    await adapter.send(
+      {
+        ...context,
+        input: {
+          text: 'Inspect',
+          context: [
+            {
+              id: 'image',
+              kind: 'image',
+              name: 'sample.png',
+              dataUrl: 'data:image/png;base64,aGVsbG8=',
+            },
+          ],
+        },
+      },
+      'Inspect',
+      'profile',
+    )
+    await vi.waitFor(() => expect(events.some((event) => event.kind === 'done')).toBe(true))
+    expect(events.find((event) => event.kind === 'requestResolved')).toMatchObject({
+      resolution: 'approved',
+      scope: 'session',
+    })
+    expect(events.filter((event) => event.kind === 'error')).toEqual([])
+    await adapter.close()
+  })
   it('correlates out-of-order responses and preserves UTF-8 NDJSON', async () => {
     const child = spawn(
       process.execPath,
@@ -98,6 +194,9 @@ describe('Codex public app-server protocol', () => {
       turnId: 'app-turn',
     })
     expect(events.filter((event) => event.kind === 'done')).toHaveLength(1)
+    expect(
+      events.find((event) => event.kind === 'requestResolved' && event.requestId === '92'),
+    ).toMatchObject({ answers: { format: ['JSON'] }, resolution: 'approved' })
     expect(events.some((event) => event.kind === 'error')).toBe(false)
     await adapter.close()
   })

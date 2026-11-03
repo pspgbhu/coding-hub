@@ -1,9 +1,9 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import { StringDecoder } from 'node:string_decoder'
+import { RedactingDiagnosticStream } from '../../shared/diagnostics'
 import type { AgentContext, EmitEvent } from '../../shared/runtime'
 import type { Model } from '../../shared/types'
-import { launch, resolveCommand, terminateProcessTree } from '../process'
-import { JsonLines, Turn, approved, outputText, type Reply } from './common'
+import { finalizeOwnedChild, launch, resolveCommand, terminateProcessTree } from '../process'
+import { JsonLines, Turn, approved, inputImages, outputText, type Reply } from './common'
 
 type Message = Record<string, any>
 type Pending = {
@@ -16,16 +16,17 @@ type Pending = {
 export class CodexRpc {
   private nextId = 0
   private closed = false
+  private failing = false
   private readonly pending = new Map<string, Pending>()
   private stderr = ''
-  private readonly decoder = new StringDecoder('utf8')
   constructor(
     readonly child: ChildProcessWithoutNullStreams,
     private readonly receive: (message: Message) => void,
-    private readonly onExit: (error?: Error) => void,
+    private readonly onExit: (error?: Error, stopped?: boolean) => void,
   ) {
     const lines = new JsonLines(
       (message) => {
+        if (this.failing || this.closed) return
         if (!message.method && message.id != null) {
           const pending = this.pending.get(String(message.id))
           if (!pending) return
@@ -40,19 +41,28 @@ export class CodexRpc {
     )
     child.stdout.on('data', (chunk: Buffer) => lines.push(chunk))
     child.stdout.on('end', () => lines.end())
-    child.stderr.on('data', (chunk: Buffer) => {
-      this.stderr = (this.stderr + this.decoder.write(chunk)).slice(-5000)
+    const diagnostics = new RedactingDiagnosticStream((text) => {
+      this.stderr = (this.stderr + text).slice(-5000)
     })
+    child.stderr.on('data', (chunk: Buffer) => diagnostics.push(chunk))
+    child.stderr.once('end', () => diagnostics.end())
     child.stdin.on('error', (error) => {
       if (!this.closed) this.fail(error)
     })
     child.once('error', (error) => this.fail(error))
-    child.once('close', (code, signal) => {
+    child.once('close', async (code, signal) => {
       if (this.closed) return
+      try {
+        await finalizeOwnedChild(child)
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)), false)
+        return
+      }
       this.fail(
         new Error(
           `Codex app-server exited (${signal ?? code ?? 'unknown'}).${this.stderr ? `\n${this.stderr}` : ''}`,
         ),
+        true,
       )
     })
   }
@@ -72,6 +82,7 @@ export class CodexRpc {
     this.write({ method, ...(params == null ? {} : { params }) })
   }
   response(id: string | number, result: unknown): void {
+    if (this.closed) throw new Error('Codex connection is closed.')
     this.write({ id, result })
   }
   rejectRequest(id: string | number, message: string): void {
@@ -80,10 +91,25 @@ export class CodexRpc {
   private write(value: unknown): void {
     if (!this.closed) this.child.stdin.write(`${JSON.stringify(value)}\n`)
   }
-  private fail(error: Error): void {
-    if (this.closed) return
-    this.close()
-    this.onExit(error)
+  private fail(error: Error, stopped = false): void {
+    if (this.closed || this.failing) return
+    this.failing = true
+    const finish = (confirmed: boolean, failure = error) => {
+      this.close()
+      this.onExit(failure, confirmed)
+    }
+    if (stopped || !this.child.pid) {
+      finish(true)
+      return
+    }
+    void terminateProcessTree(this.child).then(
+      () => finish(true),
+      (cleanupError) =>
+        finish(
+          false,
+          cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)),
+        ),
+    )
   }
   close(): void {
     if (this.closed) return
@@ -100,6 +126,10 @@ export class CodexRpc {
     timer.unref()
     this.child.once('close', () => clearTimeout(timer))
   }
+  async terminate(): Promise<void> {
+    this.close()
+    await terminateProcessTree(this.child)
+  }
 }
 
 interface Active {
@@ -108,7 +138,6 @@ interface Active {
   threadId?: string
   nativeTurnId?: string
   streamed: Set<string>
-  toolOutput: Map<string, string>
   stopped: boolean
 }
 
@@ -122,7 +151,6 @@ export class CodexAdapter {
     const state: Active = {
       turn: new Turn(context, turnId, this.emit),
       streamed: new Set(),
-      toolOutput: new Map(),
       stopped: false,
     }
     this.active.set(context.session.id, state)
@@ -133,10 +161,12 @@ export class CodexAdapter {
     path: string,
     cwd: string | undefined,
     receive: (message: Message) => void,
-    exit: (error?: Error) => void,
+    exit: (error?: Error, stopped?: boolean) => void,
+    connected?: (rpc: CodexRpc) => void,
   ): Promise<CodexRpc> {
     if (this.closed) throw new Error('Agent runtime is closing.')
     const rpc = new CodexRpc(launch(path, ['app-server'], cwd), receive, exit)
+    connected?.(rpc)
     try {
       await rpc.request('initialize', {
         clientInfo: { name: 'coding_hub', title: 'Coding Hub', version: '0.1.0' },
@@ -165,7 +195,13 @@ export class CodexAdapter {
           void this.serverRequest(state, message).catch((error) => this.end(state, error))
         else this.notification(state, message)
       },
-      (error) => this.end(state, error),
+      (error, stopped) => {
+        if (stopped === false) state.turn.failStop(error)
+        else this.end(state, error)
+      },
+      (rpc) => {
+        state.rpc = rpc
+      },
     )
     if (state.stopped) {
       state.rpc.close()
@@ -191,7 +227,10 @@ export class CodexAdapter {
     }
     const started = await state.rpc.request('turn/start', {
       threadId: state.threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
+      input: [
+        { type: 'text', text, text_elements: [] },
+        ...inputImages(turn.context).map((image) => ({ type: 'image', url: image.dataUrl })),
+      ],
       model: turn.context.session.model || undefined,
     })
     state.nativeTurnId = started.turn.id
@@ -213,12 +252,11 @@ export class CodexAdapter {
       message.method === 'item/commandExecution/outputDelta' ||
       message.method === 'item/fileChange/outputDelta'
     ) {
-      const output = (state.toolOutput.get(p.itemId) ?? '') + (p.delta ?? '')
-      state.toolOutput.set(p.itemId, output.slice(-64_000))
       state.turn.event({
         kind: 'tool',
         itemId: p.itemId,
-        output: output.slice(-64_000),
+        output: p.delta ?? '',
+        outputDelta: true,
         state: 'running',
       })
     }
@@ -236,7 +274,11 @@ export class CodexAdapter {
           name: item.tool ?? item.type,
           input: item.command ?? item.arguments ?? item.changes ?? item,
           output:
-            item.aggregatedOutput ?? outputText(item.result ?? item.contentItems ?? item.text),
+            item.aggregatedOutput ??
+            (item.result != null || item.contentItems != null || item.text != null
+              ? outputText(item.result ?? item.contentItems ?? item.text)
+              : undefined),
+          outputDelta: false,
           state:
             item.status === 'failed' || item.success === false
               ? 'error'
@@ -255,7 +297,7 @@ export class CodexAdapter {
       this.end(state, new Error(p.error?.message ?? 'Codex reported an error.'))
     if (message.method === 'serverRequest/resolved') {
       const id = String(p.requestId)
-      if (state.turn.pending.has(id)) state.turn.respond(id, { decision: 'deny' })
+      state.turn.resolveExternal(id)
     }
     if (message.method === 'turn/completed') {
       if (p.turn?.status === 'interrupted') state.turn.interrupted = true
@@ -275,24 +317,29 @@ export class CodexAdapter {
       return
     }
     if (message.method === 'item/tool/requestUserInput') {
-      const reply = await state.turn.ask(requestId, {
-        kind: 'question',
-        name: 'User input',
-        questions: (p.questions ?? []).map((question: Message) => ({
-          id: question.id,
-          title: question.question,
-          options: question.options ?? undefined,
-          multiple: false,
-        })),
-      })
-      state.rpc?.response(message.id, {
-        answers: Object.fromEntries(
-          (p.questions ?? []).map((question: Message) => [
-            question.id,
-            { answers: reply.answers?.[question.id] ?? [] },
-          ]),
-        ),
-      })
+      await state.turn.ask(
+        requestId,
+        {
+          kind: 'question',
+          name: 'User input',
+          questions: (p.questions ?? []).map((question: Message) => ({
+            id: question.id,
+            title: question.question,
+            options: question.options ?? undefined,
+            multiple: false,
+          })),
+        },
+        async (reply) => {
+          state.rpc?.response(message.id, {
+            answers: Object.fromEntries(
+              (p.questions ?? []).map((question: Message) => [
+                question.id,
+                { answers: reply.answers?.[question.id] ?? [] },
+              ]),
+            ),
+          })
+        },
+      )
     } else if (
       ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(
         message.method,
@@ -301,29 +348,60 @@ export class CodexAdapter {
       const decisions = Array.isArray(p.availableDecisions)
         ? p.availableDecisions.filter((d: unknown) => typeof d === 'string')
         : ['accept', 'decline']
-      const reply = await state.turn.ask(requestId, {
-        kind: 'approval',
-        itemId: p.itemId,
-        name: message.method.includes('commandExecution') ? 'Run command' : 'Change files',
-        text: p.reason,
-        input: p.command ?? p,
-        decisions,
-      })
-      const decision = ['acceptForSession', 'always', 'allow-session'].includes(
-        reply.decision ?? '',
+      await state.turn.ask(
+        requestId,
+        {
+          kind: 'approval',
+          itemId: p.itemId,
+          name: message.method.includes('commandExecution') ? 'Run command' : 'Change files',
+          text: p.reason,
+          input: p.command ?? p,
+          decisions,
+        },
+        async (reply) => {
+          const decision = ['acceptForSession', 'always', 'allow-session'].includes(
+            reply.decision ?? '',
+          )
+            ? 'acceptForSession'
+            : approved(reply.decision)
+              ? 'accept'
+              : 'decline'
+          state.rpc?.response(message.id, { decision })
+        },
       )
-        ? 'acceptForSession'
-        : approved(reply.decision)
-          ? 'accept'
-          : 'decline'
-      state.rpc?.response(message.id, { decision })
     } else if (message.method === 'item/permissions/requestApproval') {
-      // This host has no permission-profile editor; safely decline additional grants.
-      state.rpc?.response(message.id, { permissions: {}, scope: 'turn' })
+      await state.turn.ask(
+        requestId,
+        {
+          kind: 'approval',
+          name: 'Grant permissions',
+          scope: 'turn',
+          text: p.reason,
+          input: p.permissions ?? p,
+          decisions: ['accept', 'decline'],
+        },
+        async (reply) => {
+          // Grant only the native request's profile; renderer input cannot expand it.
+          const permissions = approved(reply.decision) ? (p.permissions ?? {}) : {}
+          if (
+            reply.permissions &&
+            JSON.stringify(reply.permissions) !== JSON.stringify(permissions)
+          )
+            throw new Error(
+              'Custom permission profiles are not supported. Approve the displayed native profile or decline it.',
+            )
+          state.rpc?.response(message.id, { permissions, scope: reply.scope ?? 'turn' })
+        },
+      )
     } else state.rpc?.rejectRequest(message.id, `Coding Hub does not support ${message.method}.`)
   }
   private end(state: Active, error?: unknown): void {
     if (state.turn.ended) return
+    if (error && state.turn.stopState === 'failed') return
+    if (state.stopped && error && ['stopping', 'failed'].includes(state.turn.stopState)) {
+      state.turn.failStop(error)
+      return
+    }
     state.turn.finish(state.turn.interrupted ? 'interrupted' : error ? 'error' : 'idle', error)
     state.rpc?.close()
     if (this.active.get(state.turn.context.session.id) === state)
@@ -333,17 +411,30 @@ export class CodexAdapter {
     const state = this.active.get(sessionId)
     if (!state) return
     state.stopped = true
-    state.turn.cancelPending()
-    if (state.threadId && state.nativeTurnId)
-      await state.rpc
-        ?.request('turn/interrupt', { threadId: state.threadId, turnId: state.nativeTurnId }, 5000)
-        .catch(() => {})
-    this.end(state)
+    state.turn.beginStop()
+    try {
+      if (state.threadId && state.nativeTurnId)
+        await state.rpc
+          ?.request(
+            'turn/interrupt',
+            { threadId: state.threadId, turnId: state.nativeTurnId },
+            5000,
+          )
+          .catch(() => {})
+      if (!state.turn.ended) {
+        if (state.rpc) await state.rpc.terminate()
+        this.end(state)
+      }
+    } catch (error) {
+      if (state.turn.ended) return
+      state.turn.failStop(error)
+      throw error
+    }
   }
   async respond(sessionId: string, requestId: string, reply: Reply): Promise<void> {
     const state = this.active.get(sessionId)
     if (!state) throw new Error('This session is no longer running.')
-    state.turn.respond(requestId, reply)
+    await state.turn.respond(requestId, reply)
   }
   async models(path: string, cwd?: string): Promise<Model[]> {
     const rpc = await this.connect(

@@ -73,6 +73,51 @@ describe('agent event contracts', () => {
       ),
     ).toBe(true)
   })
+  it('keeps failed native replies pending and records only acknowledged decisions', async () => {
+    const events: AgentEvent[] = []
+    const turn = new Turn(context, 'turn', (event) => events.push(event))
+    let attempts = 0
+    const answer = turn.ask('permission', { kind: 'approval' }, async () => {
+      if (++attempts === 1) throw new Error('Native reply failed')
+    })
+    await expect(turn.respond('permission', { decision: 'allow' })).rejects.toThrow(
+      'Native reply failed',
+    )
+    expect(turn.pending.has('permission')).toBe(true)
+    expect(events.at(-1)).toMatchObject({ kind: 'requestResolved', resolution: 'failed' })
+    await turn.respond('permission', { decision: 'always' })
+    expect(await answer).toEqual({ decision: 'always' })
+    expect(turn.pending.size).toBe(0)
+    expect(events.findLast((event) => event.kind === 'requestResolved')).toMatchObject({
+      resolution: 'approved',
+      decision: 'always',
+      scope: 'session',
+    })
+  })
+  it('retains the running turn after an unconfirmed stop and resolves external requests', async () => {
+    const events: AgentEvent[] = []
+    const turn = new Turn(context, 'turn', (event) => events.push(event))
+    const pending = turn.ask('external', { kind: 'approval' })
+    turn.resolveExternal('external')
+    expect(await pending).toMatchObject({ external: true })
+    turn.beginStop()
+    turn.failStop(new Error('Server still busy'))
+    turn.status('running')
+    expect(turn.ended).toBe(false)
+    expect(events.at(-1)).toMatchObject({ kind: 'status', status: 'stop_failed' })
+    expect(events.some((event) => event.kind === 'done')).toBe(false)
+  })
+  it('records a declined permission even when the UI includes an empty answers object', async () => {
+    const events: AgentEvent[] = []
+    const turn = new Turn(context, 'turn', (event) => events.push(event))
+    const pending = turn.ask('declined', { kind: 'approval' })
+    await turn.respond('declined', { decision: 'decline', answers: {} })
+    await pending
+    expect(events.find((event) => event.kind === 'requestResolved')).toMatchObject({
+      resolution: 'denied',
+      decision: 'decline',
+    })
+  })
   it('keeps Claude token deltas distinct and does not replay final text', () => {
     const events: AgentEvent[] = []
     const messages = new ClaudeMessages(new Turn(context, 'turn-2', (event) => events.push(event)))

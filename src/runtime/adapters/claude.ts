@@ -6,20 +6,35 @@ import {
   type SpawnedProcess,
 } from '@anthropic-ai/claude-agent-sdk'
 import { StringDecoder } from 'node:string_decoder'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import { RedactingDiagnosticStream } from '../../shared/diagnostics'
 import type { AgentContext, EmitEvent } from '../../shared/runtime'
 import type { Model } from '../../shared/types'
-import { getProcessEnvironment, launch, resolveCommand, terminateProcessTree } from '../process'
-import { AsyncQueue, Turn, approved, outputText, type Reply } from './common'
+import {
+  finalizeOwnedChild,
+  getProcessEnvironment,
+  launch,
+  resolveCommand,
+  terminateProcessTree,
+} from '../process'
+import { AsyncQueue, Turn, approved, inputImages, outputText, type Reply } from './common'
 
 interface Active {
   turn: Turn
   queue: AsyncQueue<SDKUserMessage>
   query?: Query
   controller: AbortController
+  children: Set<ChildProcessWithoutNullStreams>
 }
 
-function spawnClaude(options: SpawnOptions, stderr: (text: string) => void): SpawnedProcess {
+function spawnClaude(
+  options: SpawnOptions,
+  stderr: (text: string) => void,
+  spawned?: (child: ChildProcessWithoutNullStreams) => void,
+  cleanupFailed?: (error: unknown) => void,
+): SpawnedProcess {
   const child = launch(options.command, options.args, options.cwd, options.env)
+  spawned?.(child)
   const decoder = new StringDecoder('utf8')
   child.stderr.on('data', (chunk: Buffer) => stderr(decoder.write(chunk)))
   child.stderr.once('end', () => {
@@ -32,6 +47,20 @@ function spawnClaude(options: SpawnOptions, stderr: (text: string) => void): Spa
   options.signal.addEventListener('abort', abort, { once: true })
   child.once('close', () => options.signal.removeEventListener('abort', abort))
   if (options.signal.aborted) abort()
+  const wrappers = new Map<(...args: any[]) => void, (...args: any[]) => void>()
+  const afterCleanup = (listener: (...args: any[]) => void) => {
+    const wrapped = (...args: any[]) => {
+      void finalizeOwnedChild(child).then(
+        () => listener(...args),
+        (error) => {
+          cleanupFailed?.(error)
+          listener(...args)
+        },
+      )
+    }
+    wrappers.set(listener, wrapped)
+    return wrapped
+  }
   // Route the SDK's own forced kill through the same tree-aware owner too.
   return {
     stdin: child.stdin,
@@ -47,13 +76,20 @@ function spawnClaude(options: SpawnOptions, stderr: (text: string) => void): Spa
       return true
     },
     on: (event, listener) => {
-      child.on(event === 'exit' ? 'close' : event, listener)
+      child.on(
+        event === 'exit' ? 'close' : event,
+        event === 'exit' ? afterCleanup(listener) : listener,
+      )
     },
     once: (event, listener) => {
-      child.once(event === 'exit' ? 'close' : event, listener)
+      child.once(
+        event === 'exit' ? 'close' : event,
+        event === 'exit' ? afterCleanup(listener) : listener,
+      )
     },
     off: (event, listener) => {
-      child.off(event === 'exit' ? 'close' : event, listener)
+      child.off(event === 'exit' ? 'close' : event, wrappers.get(listener) ?? listener)
+      wrappers.delete(listener)
     },
   }
 }
@@ -183,6 +219,7 @@ export class ClaudeAdapter {
       turn: new Turn(context, turnId, this.emit),
       queue: new AsyncQueue(),
       controller: new AbortController(),
+      children: new Set(),
     }
     this.active.set(context.session.id, state)
     state.turn.status('running')
@@ -191,6 +228,9 @@ export class ClaudeAdapter {
   private async run(state: Active, text: string): Promise<void> {
     const { turn, queue } = state
     let stderr = ''
+    const diagnostics = new RedactingDiagnosticStream((text) => {
+      stderr = (stderr + text).slice(-4000)
+    })
     try {
       const path = await resolveCommand('claude', turn.context.cliPath)
       if (!path)
@@ -212,11 +252,18 @@ export class ClaudeAdapter {
           env: getProcessEnvironment({ CLAUDE_AGENT_SDK_CLIENT_APP: 'coding-hub/0.1.0' }),
           abortController: state.controller,
           spawnClaudeCodeProcess: (options) =>
-            spawnClaude(options, (value) => {
-              stderr = (stderr + value).slice(-4000)
-            }),
+            spawnClaude(
+              options,
+              (value) => {
+                diagnostics.push(value)
+              },
+              (child) => {
+                state.children.add(child)
+              },
+              (error) => state.turn.failStop(error),
+            ),
           stderr: (value) => {
-            stderr = (stderr + value).slice(-4000)
+            diagnostics.push(value)
           },
           canUseTool: async (name, input, options) => {
             const requestId = options.requestId
@@ -269,33 +316,56 @@ export class ClaudeAdapter {
       })
       queue.push({
         type: 'user',
-        message: { role: 'user', content: text },
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text },
+            ...inputImages(turn.context).map((image) => ({
+              type: 'image' as const,
+              source: { type: 'base64' as const, media_type: image.mimeType, data: image.data },
+            })),
+          ],
+        },
         parent_tool_use_id: null,
         session_id: turn.context.session.nativeId ?? '',
       })
       const messages = new ClaudeMessages(turn)
+      let completed = false
       for await (const message of state.query) {
         messages.receive(message as unknown as Record<string, any>)
-        if (message.type === 'result') break
+        if (message.type === 'result') {
+          completed = true
+          break
+        }
       }
-      turn.finish()
+      if (turn.stopState !== 'failed' && (completed || turn.stopState !== 'stopping')) turn.finish()
     } catch (error) {
+      diagnostics.end()
       const message = error instanceof Error ? error.message : String(error)
-      turn.finish(
-        turn.interrupted ? 'interrupted' : 'error',
-        new Error(`${message}${stderr && !message.includes(stderr) ? `\n${stderr}` : ''}`),
-      )
+      if (!['stopping', 'failed'].includes(turn.stopState)) {
+        try {
+          await Promise.all([...state.children].map((child) => terminateProcessTree(child)))
+        } catch (cleanupError) {
+          turn.failStop(cleanupError)
+          return
+        }
+        turn.finish(
+          turn.interrupted ? 'interrupted' : 'error',
+          new Error(`${message}${stderr && !message.includes(stderr) ? `\n${stderr}` : ''}`),
+        )
+      }
     } finally {
+      diagnostics.end()
       queue.end()
       state.query?.close()
-      if (this.active.get(turn.context.session.id) === state)
+      if (turn.ended && this.active.get(turn.context.session.id) === state)
         this.active.delete(turn.context.session.id)
     }
   }
   async interrupt(sessionId: string): Promise<void> {
     const state = this.active.get(sessionId)
     if (!state) return
-    state.turn.cancelPending()
+    state.turn.beginStop()
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
@@ -309,16 +379,23 @@ export class ClaudeAdapter {
     } finally {
       clearTimeout(timer)
     }
-    state.queue.end()
-    state.controller.abort()
-    state.query?.close()
-    state.turn.finish('interrupted')
-    this.active.delete(sessionId)
+    try {
+      state.queue.end()
+      state.controller.abort()
+      state.query?.close()
+      await Promise.all([...state.children].map((child) => terminateProcessTree(child)))
+      state.turn.finish('interrupted')
+      this.active.delete(sessionId)
+    } catch (error) {
+      if (state.turn.ended) return
+      state.turn.failStop(error)
+      throw error
+    }
   }
   async respond(sessionId: string, requestId: string, reply: Reply): Promise<void> {
     const state = this.active.get(sessionId)
     if (!state) throw new Error('This session is no longer running.')
-    state.turn.respond(requestId, reply)
+    await state.turn.respond(requestId, reply)
   }
   async models(path: string, cwd?: string): Promise<Model[]> {
     if (this.closed) throw new Error('Agent runtime is closing.')

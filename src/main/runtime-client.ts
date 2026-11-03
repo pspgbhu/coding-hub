@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { RuntimeMessage } from '../shared/runtime'
-import { redactDiagnostics } from '../shared/diagnostics'
+import { RedactingDiagnosticStream } from '../shared/diagnostics'
 
 export class RuntimeClient extends EventEmitter {
   private child?: UtilityProcess
@@ -37,6 +37,8 @@ export class RuntimeClient extends EventEmitter {
           resolve()
         } else if (message.type === 'event') this.emit('event', message.event)
         else if (message.type === 'terminal') this.emit('terminal', message.output)
+        else if (message.type === 'task') this.emit('task', message.task)
+        else if (message.type === 'ownership') this.emit('ownership', message.event)
         else if (message.type === 'response') {
           const pending = this.pending.get(message.id)
           if (!pending) return
@@ -46,11 +48,11 @@ export class RuntimeClient extends EventEmitter {
           else pending.resolve(message.result)
         }
       })
-      child.stderr?.on('data', (data) =>
-        console.error('[runtime]', redactDiagnostics(data.toString()).slice(0, 1500)),
-      )
+      const diagnostics = new RedactingDiagnosticStream((line) => this.emit('diagnostic', line))
+      child.stderr?.on('data', (data) => diagnostics.push(data))
       child.stdout?.on('data', () => {})
       child.on('exit', (code) => {
+        diagnostics.end()
         if (this.child !== child) return
         clearTimeout(timeout)
         this.child = undefined
@@ -65,11 +67,16 @@ export class RuntimeClient extends EventEmitter {
         this.emit('exit', code)
       })
     })
-    return this.ready
+    const starting = this.ready
+    void starting.catch(() => {
+      if (this.ready === starting && !this.child) this.ready = undefined
+    })
+    return starting
   }
   async call<T = any>(method: string, ...args: unknown[]): Promise<T> {
     if (this.closing && method !== 'shutdown') throw new Error('应用正在退出。')
     await this.start()
+    if (this.closing && method !== 'shutdown') throw new Error('应用正在退出。')
     return new Promise((resolve, reject) => {
       const id = randomUUID()
       const timer = setTimeout(
@@ -77,7 +84,7 @@ export class RuntimeClient extends EventEmitter {
           this.pending.delete(id)
           reject(new Error('操作超时，请检查 CLI 或重试。'))
         },
-        method === 'agent.probe' ? 60000 : 45000,
+        method === 'agent.probe' ? 60000 : method === 'project.clone' ? 130000 : 45000,
       )
       this.pending.set(id, { resolve, reject, timer })
       this.child!.postMessage({ id, method, args })
@@ -85,11 +92,35 @@ export class RuntimeClient extends EventEmitter {
   }
   async close(): Promise<void> {
     this.closing = true
-    if (!this.child) return
-    await Promise.race([
-      this.call('shutdown'),
-      new Promise((resolve) => setTimeout(resolve, 6000)),
-    ]).catch(() => {})
-    this.child?.kill()
+    const child = this.child
+    if (!child) return
+    let deadline: NodeJS.Timeout | undefined
+    try {
+      await Promise.race([
+        this.call('shutdown'),
+        new Promise((resolve) => {
+          deadline = setTimeout(resolve, 6000)
+        }),
+      ]).catch(() => {})
+    } finally {
+      if (deadline) clearTimeout(deadline)
+    }
+    if (this.child !== child) return
+    const exited = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.removeListener('exit', done)
+        reject(new Error('后台服务尚未确认退出，请重试停止。'))
+      }, 6000)
+      const done = () => {
+        clearTimeout(timeout)
+        resolve()
+      }
+      child.once('exit', done)
+    })
+    child.kill()
+    await exited
+  }
+  resumeAfterFailedClose(): void {
+    this.closing = false
   }
 }

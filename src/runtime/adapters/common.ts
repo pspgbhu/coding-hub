@@ -4,13 +4,29 @@ import type { AgentContext, EmitEvent } from '../../shared/runtime'
 import type { AgentEvent, SessionStatus } from '../../shared/types'
 import { redactDiagnostics } from '../../shared/diagnostics'
 
-export type Reply = { decision?: string; answers?: Record<string, string[]> }
+export type Reply = {
+  decision?: string
+  answers?: Record<string, string[]>
+  permissions?: Record<string, unknown>
+  scope?: 'turn' | 'session'
+  external?: boolean
+}
 export type Payload = Omit<AgentEvent, 'id' | 'sessionId' | 'turnId' | 'timestamp'>
 
 export class Turn {
   ended = false
   interrupted = false
-  readonly pending = new Map<string, (reply: Reply) => void>()
+  stopState: 'none' | 'stopping' | 'failed' | 'confirmed' = 'none'
+  readonly pending = new Map<
+    string,
+    {
+      resolve: (reply: Reply) => void
+      deliver?: (reply: Reply) => Promise<void>
+      submitting: boolean
+      scope?: AgentEvent['scope']
+      kind: AgentEvent['kind']
+    }
+  >()
   constructor(
     readonly context: AgentContext,
     readonly turnId: string,
@@ -27,36 +43,128 @@ export class Turn {
     })
   }
   status(status: SessionStatus): void {
+    if (
+      ['stopping', 'failed'].includes(this.stopState) &&
+      ['starting', 'running', 'waiting'].includes(status)
+    )
+      return
     this.event({ kind: 'status', status })
   }
-  ask(requestId: string, payload: Payload): Promise<Reply> {
+  ask(
+    requestId: string,
+    payload: Payload,
+    deliver?: (reply: Reply) => Promise<void>,
+  ): Promise<Reply> {
     if (this.interrupted || this.ended) return Promise.resolve({ decision: 'deny' })
+    if (this.pending.has(requestId)) throw new Error('The provider reused an active request ID.')
     this.status('waiting')
     return new Promise((resolve) => {
-      this.pending.set(requestId, resolve)
+      this.pending.set(requestId, {
+        resolve,
+        deliver,
+        submitting: false,
+        scope: payload.scope,
+        kind: payload.kind,
+      })
       this.event({ ...payload, requestId })
     })
   }
-  respond(requestId: string, reply: Reply): void {
-    const resolve = this.pending.get(requestId)
-    if (!resolve) throw new Error('This request is no longer waiting for a response.')
+  async respond(requestId: string, reply: Reply): Promise<void> {
+    const request = this.pending.get(requestId)
+    if (!request || this.interrupted || this.ended)
+      throw new Error('This request is no longer waiting for a response.')
+    if (request.submitting) throw new Error('This response is already being submitted.')
+    request.submitting = true
+    try {
+      await request.deliver?.(reply)
+    } catch (error) {
+      request.submitting = false
+      this.event({
+        kind: 'requestResolved',
+        requestId,
+        resolution: 'failed',
+        state: 'error',
+        text: errorMessage(error),
+      })
+      throw error
+    }
+    if (this.pending.get(requestId) !== request) return
     this.pending.delete(requestId)
-    resolve(reply)
+    const accepted =
+      request.kind === 'question'
+        ? Boolean(
+            reply.answers && Object.values(reply.answers).some((answers) => answers.length > 0),
+          )
+        : approved(reply.decision)
+    this.resolved(requestId, accepted ? 'approved' : 'denied', {
+      ...reply,
+      scope: reply.scope ?? (request.scope === 'once' ? undefined : request.scope),
+    })
+    request.resolve(reply)
     if (!this.interrupted && !this.ended && this.pending.size === 0) this.status('running')
+  }
+  resolveExternal(requestId: string): void {
+    const request = this.pending.get(requestId)
+    if (!request || request.submitting) return
+    this.pending.delete(requestId)
+    this.resolved(requestId, 'external')
+    request.resolve({ decision: 'deny', external: true })
+    if (!this.pending.size) this.status('running')
+  }
+  private resolved(
+    requestId: string,
+    resolution: NonNullable<AgentEvent['resolution']>,
+    reply?: Reply,
+  ): void {
+    this.event({
+      kind: 'requestResolved',
+      requestId,
+      resolution,
+      decision: reply?.decision,
+      answers: reply?.answers,
+      scope:
+        reply?.scope ??
+        (['always', 'acceptForSession', 'allow-session'].includes(reply?.decision ?? '')
+          ? 'session'
+          : 'once'),
+      state: 'completed',
+    })
   }
   cancelPending(): void {
     this.interrupted = true
-    for (const resolve of this.pending.values()) resolve({ decision: 'deny' })
+    for (const [requestId, request] of this.pending) {
+      this.resolved(requestId, 'cancelled', { decision: 'deny' })
+      request.resolve({ decision: 'deny' })
+    }
     this.pending.clear()
+  }
+  beginStop(): void {
+    if (this.ended) return
+    this.stopState = 'stopping'
+    this.status('stopping')
+    this.cancelPending()
+  }
+  failStop(error: unknown): void {
+    if (this.ended) return
+    this.stopState = 'failed'
+    this.event({
+      kind: 'error',
+      text: `Unable to confirm that the agent stopped: ${errorMessage(error)}`,
+    })
+    this.status('stop_failed')
   }
   finish(status: SessionStatus = this.interrupted ? 'interrupted' : 'idle', error?: unknown): void {
     if (this.ended) return
+    this.stopState = 'confirmed'
     if (error && !this.interrupted) this.event({ kind: 'error', text: errorMessage(error) })
     this.status(status)
+    for (const [requestId, request] of this.pending) {
+      this.resolved(requestId, 'expired')
+      request.resolve({ decision: 'deny' })
+    }
+    this.pending.clear()
     this.event({ kind: 'done', state: error && !this.interrupted ? 'error' : 'completed', status })
     this.ended = true
-    for (const resolve of this.pending.values()) resolve({ decision: 'deny' })
-    this.pending.clear()
   }
 }
 
@@ -82,6 +190,29 @@ export function outputText(value: unknown): string {
       .filter(Boolean)
       .join('\n')
   return value == null ? '' : JSON.stringify(value, null, 2)
+}
+
+export function inputImages(context: AgentContext): {
+  name: string
+  mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'
+  data: string
+  dataUrl: string
+}[] {
+  return (context.input?.context ?? [])
+    .filter((item) => item.kind === 'image')
+    .map((item) => {
+      const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(
+        item.dataUrl ?? '',
+      )
+      if (!match || match[2].length > 14 * 1024 * 1024)
+        throw new Error('Images must be PNG, JPEG, GIF or WebP data URLs below 10 MB.')
+      return {
+        name: item.name,
+        mimeType: match[1] as 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp',
+        data: match[2],
+        dataUrl: item.dataUrl!,
+      }
+    })
 }
 
 /** Decode bytes before framing lines: a UTF-8 character may span pipe chunks. */

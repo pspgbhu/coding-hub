@@ -27,6 +27,7 @@ vi.mock('../src/runtime/process', () => ({
   terminateProcessTree: async (child: ReturnType<typeof spawn>) => {
     child.kill()
   },
+  finalizeOwnedChild: async () => {},
 }))
 import { OpenCodeAdapter } from '../src/runtime/adapters/opencode'
 
@@ -51,6 +52,51 @@ const context = (id: string): AgentContext => ({
 })
 
 describe('OpenCode stable HTTP/SSE transport', () => {
+  it('retains failed permission replies and failed stops until the native server acknowledges them', async () => {
+    fixture.script = `
+      const http=require('http');let replies=0,aborts=0;const streams=[];
+      const auth='Basic '+Buffer.from('opencode:'+process.env.OPENCODE_SERVER_PASSWORD).toString('base64');
+      const event=(type,properties)=>streams.forEach(s=>s.write('data: '+JSON.stringify({type,properties})+'\\n\\n'));
+      http.createServer((req,res)=>{
+        if(req.headers.authorization!==auth){res.writeHead(401);res.end();return}
+        const path=new URL(req.url,'http://localhost').pathname;
+        const json=v=>{res.setHeader('content-type','application/json');res.end(JSON.stringify(v))};
+        if(path==='/event'){res.writeHead(200,{'content-type':'text/event-stream'});res.write(': connected\\n\\n');streams.push(res);return}
+        req.resume();req.on('end',()=>{
+          if(path==='/global/health'){json({healthy:true,version:'1.19.5'});return}
+          if(path==='/session'){json({id:'native-failure'});return}
+          if(path.endsWith('/prompt_async')){res.writeHead(204);res.end();event('session.status',{sessionID:'native-failure',status:{type:'busy'}});event('permission.asked',{id:'permission',sessionID:'native-failure',permission:'bash',patterns:['echo'],metadata:{}});return}
+          if(path==='/permission/permission/reply'){if(++replies===1){res.writeHead(503);res.end('Try again');return}json(true);return}
+          if(path.endsWith('/abort')){if(++aborts===1){res.writeHead(500);res.end('Still busy');return}json(true);return}
+          if(path.endsWith('/message')){json([]);return}
+          res.writeHead(404);res.end();
+        });
+      }).listen(Number(process.argv[1]),'127.0.0.1');
+    `
+    const events: AgentEvent[] = []
+    const adapter = new OpenCodeAdapter((event) => events.push(event))
+    adapters.push(adapter)
+    await adapter.send(context('failure'), 'Work', 'failure-turn')
+    await vi.waitFor(() => expect(events.some((event) => event.kind === 'approval')).toBe(true))
+    await expect(adapter.respond('failure', 'permission', { decision: 'once' })).rejects.toThrow(
+      '503',
+    )
+    expect(
+      events.some((event) => event.kind === 'requestResolved' && event.resolution === 'approved'),
+    ).toBe(false)
+    await adapter.respond('failure', 'permission', { decision: 'once' })
+    expect(events.findLast((event) => event.kind === 'requestResolved')).toMatchObject({
+      resolution: 'approved',
+    })
+    await expect(adapter.interrupt('failure')).rejects.toThrow('500')
+    expect(events.at(-1)).toMatchObject({ kind: 'status', status: 'stop_failed' })
+    expect(events.some((event) => event.kind === 'done')).toBe(false)
+    await expect(adapter.send(context('failure'), 'Other work', 'next')).rejects.toThrow(
+      'already running',
+    )
+    await adapter.interrupt('failure')
+    expect(events.at(-1)).toMatchObject({ kind: 'done', status: 'interrupted' })
+  })
   it('authenticates a project server, multiplexes sessions, and answers permissions/questions', async () => {
     fixture.launches = 0
     fixture.script = `
@@ -74,6 +120,7 @@ describe('OpenCode stable HTTP/SSE transport', () => {
             if(action==='abort'){event('session.status',{sessionID:id,status:{type:'idle'}});json(true);return}
             if(action==='prompt_async'){
               if(body.model.providerID!=='test'){res.writeHead(400);res.end();return}
+              if(body.parts[1]?.type!=='file'||body.parts[1].mime!=='image/png'){res.writeHead(400);res.end();return}
               res.writeHead(204);res.end();
               event('session.status',{sessionID:id,status:{type:'idle'}});
               setTimeout(()=>{event('session.status',{sessionID:id,status:{type:'busy'}});event('message.updated',{info:{id:'user-'+id,sessionID:id,role:'user'}});event('message.part.updated',{part:{id:'echo-'+id,sessionID:id,messageID:'user-'+id,type:'text',text:'USER ECHO'}});event('permission.asked',{id:'p-'+id,sessionID:id,permission:'bash',patterns:['echo'],metadata:{}})},10);return
@@ -109,8 +156,26 @@ describe('OpenCode stable HTTP/SSE transport', () => {
     ])
     await vi.waitFor(() => expect(fixture.children[0].signalCode).not.toBeNull())
     await Promise.all([
-      adapter.send(context('app-1'), 'First', 'turn-1'),
-      adapter.send(context('app-2'), 'Second', 'turn-2'),
+      ...['app-1', 'app-2'].map((id, index) =>
+        adapter.send(
+          {
+            ...context(id),
+            input: {
+              text: 'Inspect',
+              context: [
+                {
+                  id: 'image',
+                  kind: 'image',
+                  name: 'sample.png',
+                  dataUrl: 'data:image/png;base64,aGVsbG8=',
+                },
+              ],
+            },
+          },
+          'Inspect',
+          `turn-${index + 1}`,
+        ),
+      ),
     ])
     // A discovery that sees a send's reserved server must leave it alive.
     expect(await adapter.models(process.execPath, '/tmp')).toEqual([
