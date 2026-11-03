@@ -1,6 +1,6 @@
 # 内部打包、签名候选与更新源
 
-本仓库区分内部测试包和签名发行候选。当前版本仍为 0.1.1；代码、构建脚本与 CI 配置完成，不等于生产证书、更新 feed、目标机安装或升级已验收。逐项结果以[验证记录](verification.md)和[产品交付清单](product-plan.md)为准。
+本仓库区分自用内部包和签名发行候选。当前版本仍为 0.1.1，按纯自用交付：使用 `internal` 构建并手动更新，无需购买或配置真实发行证书、公证身份和生产更新 feed。签名、公证与生产更新流程保留为未来对外分发的可选路径。逐项验证与尚未完成的质量验收见[验证记录](verification.md)和[产品交付清单](product-plan.md)。
 
 ## 内部测试包
 
@@ -19,6 +19,8 @@ pnpm test:packaged
 
 需要完整安装器时，在原生目标系统使用 `pnpm package:mac` 或 `pnpm package:win`。内部构建不会强制要求生产签名；无有效证书时不能把产物称为已正式签名。`package:dir` 和 `test:packaged` 验证解包后的应用可执行文件，不执行 DMG / NSIS 的真实安装、卸载与升级向导。
 
+Mac 自用且不希望自动发现钥匙串中的发行身份时，使用 `CSC_IDENTITY_AUTO_DISCOVERY=false pnpm package:mac`，这也是原生 CI 使用的设置。日常升级采用[手动替换并保留数据](install-and-upgrade.md#手动升级)，无需运行 `release:mac` / `release:win`。本地 ad-hoc 技术签名与 Developer ID 发行签名、公证不同，不需要真实开发者身份；当前 pin 的 builder 26.18.0 跳过应用重签时，不能把产物描述成整个 bundle 已重新 ad-hoc 签名。
+
 `scripts/packaged-e2e.mjs` 按当前原生系统和架构，从 `release/mac`、`release/mac-arm64` 或 `release/win-unpacked` 选择应用并打印实际路径；本架构产物缺失时直接报错，不回退到其他架构的旧包。
 
 本机 macOS 另有独立 DMG 安装升级验证。确认旧、新 DMG 都已完整生成，且没有打包进程正在替换这些文件后运行：
@@ -34,7 +36,7 @@ node scripts/macos-install-smoke.mjs \
 
 每份报告覆盖其记录架构上的原生 macOS 复制、替换与删除应用流程，不覆盖 Finder 拖放操作、Gatekeeper、隔离属性、公证、生产签名、更新 feed 下载、Windows NSIS 或人工辅助技术验收。某个架构的通过结果不能替代另一架构的实际运行记录。
 
-## 签名候选配置
+## 未来可选：签名候选配置
 
 `electron-builder.release.yml` 继承默认配置，启用强制签名、macOS hardened runtime / notarization、Windows 更新签名校验，并将构建通道设为 `stable`。它从 `CODING_HUB_UPDATE_URL` 写入 generic HTTPS 更新源。
 
@@ -94,7 +96,7 @@ node scripts/checksums.mjs
 
 脚本为 `release/` 中的安装器、更新 YAML 和 blockmap 生成 `SHA256SUMS.txt`。它证明文件是否与某份清单一致，不替代代码签名、发行者身份或安装验收。
 
-## 部署更新 feed
+## 未来可选：部署更新 feed
 
 当前工作流只保留候选产物，不自动上传 generic feed。electron-builder 的 generic provider 需要维护者自行部署安装文件和更新元数据；打包应用内的 `app-update.yml` 是客户端配置，不是可直接拿来替代服务器 `latest*.yml` 的更新清单。[electron-builder v26 更新文档](https://www.electron.build/v26/docs/features/auto-update/)说明这一区别。
 

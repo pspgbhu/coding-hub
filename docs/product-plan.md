@@ -1,8 +1,14 @@
 # Coding Hub 1.0 delivery ledger
 
 This ledger tracks the accepted product plan. A passing legacy test suite does not
-prove these additions complete. Each unchecked requirement remains part of the
-active goal; external platform/signing requirements must be reported truthfully.
+prove these additions complete. Each unchecked requirement in the active sections
+remains part of the goal; optional future distribution work is listed separately.
+
+The owner clarified that the current product is for personal use. Use the existing
+`internal` build and manual updates. A Developer ID / production signing certificate,
+Apple notarization identity and production update feed are not required for this
+delivery mode. This changes distribution requirements, not the verification status
+of accessibility, physical hardware or performance.
 
 Updated 2026-11-03. Checked implementation items below have local macOS x64
 unit/service or UI evidence. They do not imply that every supported platform,
@@ -54,7 +60,7 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [x] Paged history, virtual rendering, Chinese search, bounded streaming and long-output loading.
 - [x] Restricted untrusted folders: no project Agent/PTY/script execution before trust.
 - [x] Implement update state/progress/retry, release notes, explicit download/install and safe deferred restart; provide separate internal/stable build profiles and guarded signing scripts.
-- [ ] Production signing/notarization, a lasting HTTPS update feed and a verified real signed upgrade with safe deferred restart.
+- [x] Personal-use internal builds and manual replacement upgrades preserve data without requiring production signing, notarization or an update feed.
 - [x] macOS x64/arm64 and Windows x64 packaged-app, install, upgrade and retained-data uninstall verification on native-architecture CI at product commit `2f01652`.
 - [x] Local macOS x64 internal DMG copy/replace upgrade and removal preserve isolated user data. This excludes Gatekeeper, quarantine and production signing.
 - [x] Install/upgrade/troubleshooting/privacy/compatibility/changelog/support documentation.
@@ -69,17 +75,27 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [ ] Native hardware DPI, operating-system scaling and multi-display acceptance on supported platforms.
 - [ ] Benchmark: 1,000 sessions, 10,000-event conversation, 50,000 files; startup ≤5s, first page ≤1s, search p95 ≤500ms on fixed CI hardware.
 - [x] Native packaged dependencies, upgrade preservation and backup recovery on all three native CI targets.
-- [ ] Production signed update-failure checks, including an invalid signature and interrupted download.
 
 Product commit `2f01652` passed the complete native CI matrix, including actual
 old-version installation, upgrade and retained-data uninstall. The remaining
-release gates require hardware DPI and multi-display checks, manual assistive-
-technology use, fixed dedicated CI measurements and production signing/
-notarization/feed upgrade success and failure. Native-architecture hosted runners
-and mocked updater tests cannot close these gates. Evidence and runnable commands
-are retained in the verification record.
+quality gates require hardware DPI and multi-display checks, manual assistive-
+technology use and fixed dedicated CI measurements. Native-architecture hosted
+runners do not close these gates. Evidence and runnable commands are retained in
+the verification record.
+
+## Optional future public distribution
+
+These items are deferred and unverified, rather than requirements for current
+personal use:
+
+- Production signing/notarization and Gatekeeper / SmartScreen distribution acceptance.
+- A lasting HTTPS update feed and a verified real signed upgrade with safe deferred restart.
+- Production signed update-failure checks, including an invalid signature and interrupted download.
+
+The guarded stable build profile and update-signature checks remain available for
+this future mode; personal use does not require weakening them.
 
 Live account tests remain opt-in. Cloud sync, team accounts, remote execution,
 Linux/WSL, extension marketplace, a full LSP, automatic cross-Agent handoffs and
-external CLI history import are outside 1.0. Production signing/feed configuration
-is external; absent it, builds must identify themselves as internal test builds.
+external CLI history import are outside 1.0. Personal-use builds keep the internal
+channel; the stable profile is reserved for a configured signed distribution.

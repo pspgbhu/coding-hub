@@ -2,7 +2,7 @@
 
 面向个人开发者的本地多 Agent 编程工作台。连接已安装的 Claude Code、Codex CLI 和 OpenCode，在一个桌面应用中完成任务、代码审阅、检查和 Git 交付。
 
-当前代码版本为 **0.1.1**，正在按 [1.0 产品交付清单](docs/product-plan.md) 完善。默认打包产物属于内部测试构建；生产签名、更新源和目标系统安装验收的状态见 [验证记录](docs/verification.md)，不能把工作流配置视为已通过验收。
+当前代码版本为 **0.1.1**，正在按 [1.0 产品交付清单](docs/product-plan.md) 完善。当前按纯自用交付：使用 `internal` 构建并手动更新，无需真实发行证书、公证身份或生产更新源。签名发行候选保留为未来对外分发的可选流程；实际验证与尚未完成的质量验收见 [验证记录](docs/verification.md)。
 
 ![Coding Hub 工作台](docs/images/workspace-dark.png)
 
@@ -109,7 +109,7 @@ pnpm package:dir
 pnpm test:packaged
 ```
 
-安装包输出在 `release/`。应在目标系统构建、运行 packaged E2E，并另行验收安装、升级、卸载与签名；这些步骤的具体区别见 [发行指南](docs/releasing.md)。
+安装包输出在 `release/`。应在目标系统构建、运行 packaged E2E，并另行验收安装、升级与卸载。签名、公证和生产自动更新属于未来对外分发流程，非当前自用要求；具体步骤见 [发行指南](docs/releasing.md)。
 
 真实账号测试仅显式启用 `CODING_HUB_LIVE_SMOKE=1` 后运行 `scripts/live-smoke.mjs`，会产生原 CLI 的请求与账号用量。可用 `CODING_HUB_CODEX_MODEL` 指定测试模型。官方 OpenCode 二进制的无模型协议检查见 `scripts/opencode-server-smoke.mjs`。
 
