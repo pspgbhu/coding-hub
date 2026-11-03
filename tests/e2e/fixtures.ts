@@ -79,7 +79,12 @@ export interface Desktop {
   location: string
   projectPath: string
   cliPaths: Record<ProviderId, string>
-  restart(): Promise<{ app: ElectronApplication; page: Page; launchStartedAt: number }>
+  restart(): Promise<{
+    app: ElectronApplication
+    page: Page
+    launchStartedAt: number
+    launchTimings: { mainConnectedMs: number; firstWindowMs: number; domReadyMs: number }
+  }>
 }
 export const test = base.extend<{ desktop: Desktop }>({
   desktop: async ({}, use) => {
@@ -157,14 +162,22 @@ export const test = base.extend<{ desktop: Desktop }>({
         args: executablePath ? [] : [resolve('.')],
         env,
       })
+      const mainConnectedMs = performance.now() - launchStartedAt
       current = app
       app.once('close', () => {
         if (current === app) current = undefined
       })
       const page = await app.firstWindow()
+      const firstWindowMs = performance.now() - launchStartedAt
       page.on('pageerror', (error) => errors.push(error.message))
       await page.waitForLoadState('domcontentloaded')
-      return { app, page, launchStartedAt }
+      const domReadyMs = performance.now() - launchStartedAt
+      return {
+        app,
+        page,
+        launchStartedAt,
+        launchTimings: { mainConnectedMs, firstWindowMs, domReadyMs },
+      }
     }
     const initial = await launch()
     const desktop: Desktop = {

@@ -50,7 +50,6 @@ import { ACTIVE_STATUSES, PROVIDERS } from '../shared/types'
 import { api, appendEvent, errorText, shortPath } from './lib/api'
 import { flushBeforeClose } from './lib/close-flush'
 import Chat from './components/Chat'
-import TerminalPanel from './components/TerminalPanel'
 import LayoutHandles from './components/LayoutHandles'
 import WindowedSessionList from './components/WindowedSessionList'
 import {
@@ -61,6 +60,7 @@ import {
   WorkspaceActions,
 } from './components/ProductPanels'
 const Workspace = lazy(() => import('./components/Workspace'))
+const TerminalPanel = lazy(() => import('./components/TerminalPanel'))
 const providerIds: ProviderId[] = ['claude', 'codex', 'opencode']
 function ReadinessGrid({ info }: { info?: ProviderInfo }) {
   return (
@@ -1489,25 +1489,44 @@ function App() {
           {workspaces
             .filter((item) => terminalProjects.includes(item.id))
             .map((item) => (
-              <TerminalPanel
+              <Suspense
                 key={item.id}
-                project={workspaceProject(item)}
-                visible={terminal && item.id === activeWorkspace?.id}
-                theme={theme}
-                settings={settings}
-                onError={reportError}
-                onContext={(content) =>
-                  setContext({
-                    id: crypto.randomUUID(),
-                    kind: 'terminal',
-                    name: '终端输出',
-                    content,
-                  })
+                fallback={
+                  <section
+                    className="terminal-panel"
+                    role="status"
+                    aria-label="正在打开终端"
+                    style={{
+                      display: terminal && item.id === activeWorkspace?.id ? undefined : 'none',
+                      height: settings?.terminalHeight || undefined,
+                    }}
+                  >
+                    <div className="terminal-toolbar">
+                      <LoaderCircle className="spin" size={13} />
+                      <span>正在打开终端…</span>
+                    </div>
+                  </section>
                 }
-                onClose={() => {
-                  if (item.id === activeWorkspace?.id) setTerminal(false)
-                }}
-              />
+              >
+                <TerminalPanel
+                  project={workspaceProject(item)}
+                  visible={terminal && item.id === activeWorkspace?.id}
+                  theme={theme}
+                  settings={settings}
+                  onError={reportError}
+                  onContext={(content) =>
+                    setContext({
+                      id: crypto.randomUUID(),
+                      kind: 'terminal',
+                      name: '终端输出',
+                      content,
+                    })
+                  }
+                  onClose={() => {
+                    if (item.id === activeWorkspace?.id) setTerminal(false)
+                  }}
+                />
+              </Suspense>
             ))}
         </main>
       </div>

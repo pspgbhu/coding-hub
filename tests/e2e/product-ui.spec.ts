@@ -239,6 +239,32 @@ test('one thousand stored sessions mount only visible sidebar rows and old searc
     conversationEvents: 10000,
     firstHistoryEvents: 100,
     startupMs,
+    launchTimings: {
+      ...restarted.launchTimings,
+      sidebarAfterDomReadyMs: startupMs - restarted.launchTimings.domReadyMs,
+    },
+    rendererNavigation: await page.evaluate(() => {
+      const navigation = window.performance.getEntriesByType('navigation')[0] as
+        PerformanceNavigationTiming | undefined
+      return navigation
+        ? {
+            responseEnd: navigation.responseEnd,
+            domInteractive: navigation.domInteractive,
+            domContentLoadedEventEnd: navigation.domContentLoadedEventEnd,
+            loadEventEnd: navigation.loadEventEnd,
+            visibility: document.visibilityState,
+            focused: document.hasFocus(),
+          }
+        : undefined
+    }),
+    windows: await desktop.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows().map((window) => ({
+        visible: window.isVisible(),
+        focused: window.isFocused(),
+        minimized: window.isMinimized(),
+        loading: window.webContents.isLoading(),
+      })),
+    ),
     firstHistoryRenderMs,
     mountedSidebarRows: await list.getByRole('listitem').count(),
     machine: {
