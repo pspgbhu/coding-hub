@@ -200,6 +200,16 @@ describe('task lifecycle and persistence boundaries', () => {
   })
 
   it('does not launch or leave a stale running reservation when initial persistence fails', async () => {
+    const launch = vi.spyOn(processes, 'launch')
+    const events: TaskRun[] = []
+    let resolveCompleted: (run: TaskRun) => void
+    const completed = new Promise<TaskRun>((resolve) => {
+      resolveCompleted = resolve
+    })
+    tasks = new TaskService((run) => {
+      events.push(run)
+      if (run.status !== 'running') resolveCompleted(run)
+    })
     await fs.mkdir(data)
     await fs.writeFile(join(data, 'tasks'), 'blocks directory creation')
     const workspace = randomUUID(),
@@ -212,11 +222,36 @@ describe('task lifecycle and persistence boundaries', () => {
         definition(`require('fs').writeFileSync(${JSON.stringify(marker)},'bad')`),
       ),
     ).rejects.toThrow()
+    expect(launch).not.toHaveBeenCalled()
+    expect(events).toEqual([])
     await expect(fs.stat(marker)).rejects.toMatchObject({ code: 'ENOENT' })
     await fs.rm(join(data, 'tasks'))
-    const run = await tasks.run(root, data, workspace, definition('process.exit(0)'))
-    await expect.poll(async () => (await tasks.list(data))[0].status).toBe('passed')
-    expect(run.id).toBeTruthy()
+    const run = await tasks.run(
+      root,
+      data,
+      workspace,
+      definition(
+        `require('fs').writeFileSync(${JSON.stringify(marker)},'retried');console.log('retry completed');process.exit(0)`,
+      ),
+    )
+    expect(launch.mock.calls.filter(([command]) => command === process.execPath)).toHaveLength(1)
+    // run() acknowledges startup. The terminal event follows verified native-process cleanup
+    // and the final persistence attempt; it is the completion barrier, not a 1s UI poll.
+    const result = await completed
+    expect(result).toMatchObject({
+      id: run.id,
+      workspaceId: workspace,
+      status: 'passed',
+      exitCode: 0,
+    })
+    expect(result.finishedAt).toBeGreaterThanOrEqual(run.startedAt)
+    expect(result.output).toContain('retry completed')
+    expect(await fs.readFile(marker, 'utf8')).toBe('retried')
+    const stored: TaskRun = JSON.parse(
+      await fs.readFile(join(data, 'tasks', `${run.id}.json`), 'utf8'),
+    )
+    expect(stored).toEqual(result)
+    expect((await tasks.list(data, workspace)).find((entry) => entry.id === run.id)).toEqual(result)
   })
 
   it('retains running status on a failed stop and allows a confirmed retry', async () => {
