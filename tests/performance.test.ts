@@ -72,10 +72,16 @@ function event(sessionId: string, index: number, text: string): AgentEvent {
     timestamp: Date.now(),
   }
 }
-afterEach(async () => {
-  for (const store of stores.splice(0)) if (store.db.open) store.close()
-  for (const directory of locations.splice(0)) await rm(directory, { recursive: true, force: true })
-})
+// Removing 50,000 real fixture files on NTFS is outside every measured product operation.
+// Give only this cleanup hook its own budget; the workload and performance gates stay unchanged.
+afterEach(
+  async () => {
+    for (const store of stores.splice(0)) if (store.db.open) store.close()
+    for (const directory of locations.splice(0))
+      await rm(directory, { recursive: true, force: true })
+  },
+  full ? 60000 : 10000,
+)
 
 describe(full ? 'full opt-in product benchmarks' : 'small performance regression fixtures', () => {
   it(
