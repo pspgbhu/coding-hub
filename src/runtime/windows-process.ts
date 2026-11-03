@@ -6,6 +6,8 @@ const SYNCHRONIZE = 0x00100000
 const WAIT_OBJECT_0 = 0
 const WAIT_TIMEOUT = 258
 const ERROR_INVALID_PARAMETER = 87
+const ERROR_ACCESS_DENIED = 5
+const EXIT_CONFIRMATION_MS = 4000
 const FILETIME_EPOCH_TICKS = 504911232000000000n
 
 export interface WindowsProcessLease {
@@ -13,8 +15,8 @@ export interface WindowsProcessLease {
   /** UTC .NET ticks at CIM's microsecond precision; the exact FILETIME stays pinned internally. */
   readonly started: string
   isAlive(): boolean
-  /** Initiates termination; the caller must still wait for confirmed exit before releasing ownership. */
-  terminate(): void
+  /** Resolves only after native exit confirmation within the caller's existing cleanup deadline. */
+  terminate(deadline?: number): Promise<void>
   close(): void
 }
 
@@ -69,6 +71,7 @@ export function createWindowsProcessSupervisor(api: WindowsProcessApi, currentPi
     // while all termination-handle checks below compare the full native 100ns identity.
     const started = (((exactBirth + FILETIME_EPOCH_TICKS) / 10n) * 10n).toString()
     let closed = false
+    let terminating: Promise<void> | undefined
     const assertOpen = (): void => {
       if (closed) throw new Error('The Windows process lease is closed.')
     }
@@ -79,34 +82,77 @@ export function createWindowsProcessSupervisor(api: WindowsProcessApi, currentPi
       if (result === WAIT_TIMEOUT) return true
       throw failed('WaitForSingleObject')
     }
+    const waitForExit = async (deadline: number, failure?: Error): Promise<void> => {
+      while (isAlive()) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0)
+          throw (
+            failure ??
+            new Error('Windows process exit was not confirmed before the cleanup deadline.')
+          )
+        // Never block the runtime/main event loop in a native wait. The original query pin
+        // remains valid throughout, including when Windows is still cancelling pending I/O.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)))
+      }
+    }
     return {
       pid,
       started,
       isAlive,
-      terminate() {
-        assertOpen()
-        if (!isAlive()) return
-        // Keep the query handle open: it pins this process object/PID even after exit.
-        // Request termination rights only when needed, without weakening initial capture.
-        const target = api.openProcess(rights | PROCESS_TERMINATE, 0, pid)
-        if (target == null) {
-          const error = failed('OpenProcess for termination')
+      terminate(deadline = Date.now() + EXIT_CONFIRMATION_MS) {
+        if (terminating) return terminating
+        const operation = (async () => {
+          assertOpen()
+          if (!Number.isFinite(deadline)) throw new Error('Invalid Windows cleanup deadline.')
           if (!isAlive()) return
-          throw error
-        }
-        try {
-          if (birth(target) !== exactBirth)
-            throw new Error('The termination handle has a different native process birth identity.')
-          if (!api.terminateProcess(target, 130)) {
-            const error = failed('TerminateProcess')
-            if (isAlive()) throw error
+          if (Date.now() >= deadline)
+            throw new Error('Windows process exit was not confirmed before the cleanup deadline.')
+          // Keep the query handle open: it pins this process object/PID even after exit.
+          // Request termination rights only when needed, without weakening initial capture.
+          const target = api.openProcess(rights | PROCESS_TERMINATE, 0, pid)
+          if (target == null) {
+            const code = api.getLastError()
+            const error = new Error(`OpenProcess for termination failed (Windows error ${code}).`)
+            if (code !== ERROR_ACCESS_DENIED) throw error
+            await waitForExit(deadline, error)
+            return
           }
-        } finally {
-          closeHandle(target)
-        }
+          let exitFailure: Error | undefined
+          try {
+            if (birth(target) !== exactBirth)
+              throw new Error(
+                'The termination handle has a different native process birth identity.',
+              )
+            if (!api.terminateProcess(target, 130)) {
+              const code = api.getLastError()
+              const error = new Error(`TerminateProcess failed (Windows error ${code}).`)
+              if (code !== ERROR_ACCESS_DENIED) throw error
+              // Error 5 can accompany a process already exiting. It is never success by
+              // itself: only this exact pinned process object's signalled state confirms exit.
+              exitFailure = error
+            }
+          } finally {
+            closeHandle(target)
+          }
+          await waitForExit(deadline, exitFailure)
+        })()
+        terminating = operation
+        void operation.then(
+          () => {
+            terminating = undefined
+          },
+          () => {
+            terminating = undefined
+          },
+        )
+        return operation
       },
       close() {
         if (closed) return
+        if (terminating)
+          throw new Error(
+            'Cannot close a Windows process lease while exit confirmation is pending.',
+          )
         closeHandle(handle)
         closed = true
       },

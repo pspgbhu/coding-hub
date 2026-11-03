@@ -483,6 +483,7 @@ function ownWindowsProcessTree(
         // Each lease is a process object, not a numeric PID kill. Never delegate
         // tree traversal to taskkill /T, which can exceed this verified set.
         const targets = [...leases.values()]
+        const deadline = Date.now() + 4000
         for (const target of targets.reverse()) {
           if (!target.isAlive()) continue
           const fresh = await processSnapshot()
@@ -491,9 +492,8 @@ function ownWindowsProcessTree(
             throw new Error(
               'New descendants require another confirmed cleanup. Ownership was retained.',
             )
-          if (target.isAlive()) target.terminate()
+          if (target.isAlive()) await target.terminate(deadline)
         }
-        const deadline = Date.now() + 4000
         while ([...leases.values()].some((lease) => lease.isAlive())) {
           if (Date.now() >= deadline)
             throw new Error('Owned processes did not stop. Ownership was retained.')

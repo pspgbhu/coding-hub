@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawn } from 'node:child_process'
 import {
   acquireWindowsProcess,
@@ -20,16 +20,17 @@ function fixture() {
       creation.writeBigUInt64LE(exactBirth)
       return 1
     }),
-    waitForSingleObject: vi.fn(() => 258),
+    waitForSingleObject: vi.fn((_handle: unknown, _milliseconds: number) => 258),
     terminateProcess: vi.fn(() => 1),
     closeHandle: vi.fn(() => 1),
     getLastError: vi.fn(() => 5),
   } satisfies WindowsProcessApi
   return { api, query, target, supervisor: createWindowsProcessSupervisor(api, 100) }
 }
+afterEach(() => vi.useRealTimers())
 
 describe('pinned Windows native process identity', () => {
-  it('captures synchronously with query/synchronize rights and keeps the process pinned after exit', () => {
+  it('captures synchronously with query/synchronize rights and keeps the process pinned after exit', async () => {
     const { api, supervisor, query } = fixture()
     const lease = supervisor.acquire(42)!
     expect(api.openProcess).toHaveBeenCalledWith(0x101000, 0, 42)
@@ -38,40 +39,44 @@ describe('pinned Windows native process identity', () => {
     expect(lease.isAlive()).toBe(true)
     api.waitForSingleObject.mockReturnValue(0)
     expect(lease.isAlive()).toBe(false)
-    lease.terminate()
+    await lease.terminate()
     expect(api.terminateProcess).not.toHaveBeenCalled()
     expect(api.closeHandle).not.toHaveBeenCalled()
     lease.close()
     lease.close()
     expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(query)
     expect(() => lease.isAlive()).toThrow('lease is closed')
-    expect(() => lease.terminate()).toThrow('lease is closed')
+    await expect(lease.terminate()).rejects.toThrow('lease is closed')
   })
 
-  it('terminates through a separately opened handle while retaining the original query pin', () => {
+  it('terminates through a separately opened handle while retaining the original query pin', async () => {
+    vi.useFakeTimers()
     const { api, supervisor, query, target } = fixture()
     const lease = supervisor.acquire(42)!
-    lease.terminate()
+    const completed = lease.terminate()
     expect(api.openProcess).toHaveBeenLastCalledWith(0x101001, 0, 42)
     expect(api.terminateProcess).toHaveBeenCalledExactlyOnceWith(target, 130)
     expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(target)
     expect(api.closeHandle).not.toHaveBeenCalledWith(query)
-    // A successful request is asynchronous; the lease must still report the native wait state.
+    // A successful request is asynchronous; completion still waits for this process's signal.
     expect(lease.isAlive()).toBe(true)
+    expect(() => lease.close()).toThrow('exit confirmation is pending')
     api.waitForSingleObject.mockReturnValue(0)
+    await vi.advanceTimersByTimeAsync(25)
+    await completed
     expect(lease.isAlive()).toBe(false)
     lease.close()
     expect(api.closeHandle).toHaveBeenLastCalledWith(query)
   })
 
-  it('rejects a different 100ns identity even when both births have the same CIM microsecond', () => {
+  it('rejects a different 100ns identity even when both births have the same CIM microsecond', async () => {
     const { api, supervisor, query, target } = fixture()
     const lease = supervisor.acquire(42)!
     api.getProcessTimes.mockImplementation((_handle, creation) => {
       creation.writeBigUInt64LE(exactBirth + 1n)
       return 1
     })
-    expect(() => lease.terminate()).toThrow('different native process birth identity')
+    await expect(lease.terminate()).rejects.toThrow('different native process birth identity')
     expect(api.terminateProcess).not.toHaveBeenCalled()
     expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(target)
     expect(api.closeHandle).not.toHaveBeenCalledWith(query)
@@ -96,28 +101,99 @@ describe('pinned Windows native process identity', () => {
     expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(query)
   })
 
-  it('does not turn wait or live-process termination failures into successful cleanup', () => {
+  it('does not turn wait or non-racing termination errors into successful cleanup', async () => {
     const { api, supervisor, query, target } = fixture()
     const lease = supervisor.acquire(42)!
     api.waitForSingleObject.mockReturnValueOnce(0xffffffff)
     expect(() => lease.isAlive()).toThrow('WaitForSingleObject failed')
+    api.getLastError.mockReturnValue(6)
     api.openProcess.mockReturnValueOnce(null as never)
-    expect(() => lease.terminate()).toThrow('OpenProcess for termination failed')
+    await expect(lease.terminate()).rejects.toThrow('OpenProcess for termination failed')
     api.terminateProcess.mockReturnValueOnce(0)
-    expect(() => lease.terminate()).toThrow('TerminateProcess failed')
+    await expect(lease.terminate()).rejects.toThrow('TerminateProcess failed')
     expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(target)
     expect(api.closeHandle).not.toHaveBeenCalledWith(query)
     expect(lease.isAlive()).toBe(true)
     lease.close()
   })
 
-  it('accepts a concurrent native exit after a failed termination request without releasing its pin', () => {
+  it('accepts a concurrent native exit after a failed termination request without releasing its pin', async () => {
     const { api, supervisor } = fixture()
     const lease = supervisor.acquire(42)!
     api.terminateProcess.mockReturnValueOnce(0)
     api.waitForSingleObject.mockReturnValueOnce(258).mockReturnValueOnce(0)
-    expect(() => lease.terminate()).not.toThrow()
+    await expect(lease.terminate()).resolves.toBeUndefined()
     expect(api.closeHandle).toHaveBeenCalledTimes(1)
+    lease.close()
+  })
+
+  it('waits asynchronously for a delayed process signal after error 5 and shares pending confirmation', async () => {
+    vi.useFakeTimers()
+    const { api, supervisor, query, target } = fixture()
+    const lease = supervisor.acquire(42)!
+    api.terminateProcess.mockReturnValueOnce(0)
+    let confirmed = false
+    const completed = lease.terminate(Date.now() + 100)
+    expect(lease.terminate(Date.now() + 10000)).toBe(completed)
+    void completed.then(() => {
+      confirmed = true
+    })
+    let eventLoopRan = false
+    setTimeout(() => {
+      eventLoopRan = true
+    }, 10)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(eventLoopRan).toBe(true)
+    expect(confirmed).toBe(false)
+    expect(api.terminateProcess).toHaveBeenCalledOnce()
+    expect(api.closeHandle).toHaveBeenCalledExactlyOnceWith(target)
+    expect(api.closeHandle).not.toHaveBeenCalledWith(query)
+    expect(api.waitForSingleObject.mock.calls.every((call) => call[1] === 0)).toBe(true)
+    api.waitForSingleObject.mockReturnValue(0)
+    await vi.advanceTimersByTimeAsync(25)
+    await completed
+    expect(confirmed).toBe(true)
+    lease.close()
+  })
+
+  it.each(['open', 'terminate'] as const)(
+    'rejects persistent error 5 at the original deadline and retains the pin (%s)',
+    async (failure) => {
+      vi.useFakeTimers()
+      const { api, supervisor, query } = fixture()
+      const lease = supervisor.acquire(42)!
+      if (failure === 'open') api.openProcess.mockReturnValueOnce(null as never)
+      else api.terminateProcess.mockReturnValueOnce(0)
+      const deadline = Date.now() + 100
+      const completed = lease.terminate(deadline)
+      const rejected = expect(completed).rejects.toThrow('Windows error 5')
+      await vi.advanceTimersByTimeAsync(99)
+      expect(lease.isAlive()).toBe(true)
+      expect(api.closeHandle).not.toHaveBeenCalledWith(query)
+      expect(() => lease.close()).toThrow('exit confirmation is pending')
+      await vi.advanceTimersByTimeAsync(1)
+      await rejected
+      expect(lease.isAlive()).toBe(true)
+      expect(api.closeHandle).not.toHaveBeenCalledWith(query)
+      // A later confirmed retry can finish; the failed wait never released the original pin.
+      api.waitForSingleObject.mockReturnValue(0)
+      await lease.terminate()
+      lease.close()
+      expect(api.closeHandle).toHaveBeenLastCalledWith(query)
+    },
+  )
+
+  it('rejects wait failure during asynchronous confirmation without closing the query pin', async () => {
+    vi.useFakeTimers()
+    const { api, supervisor, query } = fixture()
+    const lease = supervisor.acquire(42)!
+    const completed = lease.terminate(Date.now() + 100)
+    const rejected = expect(completed).rejects.toThrow('WaitForSingleObject failed')
+    api.waitForSingleObject.mockReturnValue(0xffffffff)
+    await vi.advanceTimersByTimeAsync(25)
+    await rejected
+    expect(api.closeHandle).not.toHaveBeenCalledWith(query)
+    api.waitForSingleObject.mockReturnValue(0)
     lease.close()
   })
 
@@ -176,7 +252,7 @@ describe('pinned Windows native process identity', () => {
       } finally {
         same?.close()
         if (lease?.isAlive()) {
-          lease.terminate()
+          await lease.terminate()
           await exited
         } else if (!lease) {
           // The exact ChildProcess handle is safe even if native capture itself failed.
