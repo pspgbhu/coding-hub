@@ -160,7 +160,9 @@ test('a forced renderer crash automatically reloads persisted drafts and keeps t
         return {
           draft: document.querySelector('textarea[aria-label="消息输入框"]')?.value,
           editor: document.querySelector('.workspace .monaco-editor .view-lines')?.textContent,
-          terminal: document.querySelector('.terminal-panel .xterm-rows')?.textContent
+          terminal: document.querySelector('.terminal-panel .xterm-rows')?.textContent,
+          terminalConnecting: Array.from(document.querySelectorAll('.terminal-panel [role="status"]'))
+            .some((entry) => entry.textContent?.includes('正在重新连接'))
         };
       })()`)
     }, windowIdentity.windowId)
@@ -168,6 +170,7 @@ test('a forced renderer crash automatically reloads persisted drafts and keeps t
     draft,
     editor: expect.stringContaining('CRASH_UNSAVED_EDITOR'),
     terminal: expect.stringContaining('RENDERER_BEFORE_CRASH'),
+    terminalConnecting: false,
   })
   const recoveredIdentity = await app.evaluate(({ BrowserWindow }, id) => {
     const window = BrowserWindow.fromId(id)!

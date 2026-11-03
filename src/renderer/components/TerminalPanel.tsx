@@ -150,13 +150,19 @@ function TerminalSession(props: SessionProps) {
         if (disposed) return
         lastSequence = snapshot.sequence ?? 0
         exited = snapshot.exitCode !== undefined
-        if (snapshot.buffer) terminal.write(snapshot.buffer)
-        attached = true
-        setState(exited ? `已退出 · ${snapshot.exitCode}` : '')
-        if (exited) latest.current.onExit(snapshot.id, snapshot.exitCode!)
-        buffered.splice(0).forEach(output)
-        resize()
-        if (latest.current.visible) terminal.focus()
+        const completeAttach = () => {
+          if (disposed) return
+          attached = true
+          setState(exited ? `已退出 · ${snapshot.exitCode}` : '')
+          if (exited) latest.current.onExit(snapshot.id, snapshot.exitCode!)
+          buffered.splice(0).forEach(output)
+          resize()
+          if (latest.current.visible) terminal.focus()
+        }
+        // write() parses asynchronously and can emit device replies through onData.
+        // Historical queries must finish before live PTY input and buffered output resume.
+        if (snapshot.buffer) terminal.write(snapshot.buffer, completeAttach)
+        else completeAttach()
       })
       .catch((error) => {
         if (!disposed) {
