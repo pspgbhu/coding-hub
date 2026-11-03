@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 jobs:
   desktop:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -18,6 +19,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 11.24.0
@@ -41,6 +44,37 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Smoke test the packaged application
         run: node scripts/packaged-e2e.mjs
+      - name: Build pinned native 0.1.0 installer outside the current checkout
+        id: installation-baseline
+        run: node scripts/build-install-baseline.mjs
+        env:
+          CODING_HUB_INSTALL_SMOKE: '1'
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Native macOS install, old-version upgrade and retained-data uninstall
+        if: runner.os == 'macOS'
+        run: |
+          node scripts/macos-install-smoke.mjs --old-dmg "$OLD_INSTALLER" --new-dmg "$NEW_INSTALLER" --output "coverage/installation/macos-${{ matrix.arch }}.json"
+          node scripts/build-install-baseline.mjs --verify-report "coverage/installation/macos-${{ matrix.arch }}.json"
+        env:
+          OLD_INSTALLER: ${{ steps.installation-baseline.outputs.old_installer }}
+          NEW_INSTALLER: ${{ steps.installation-baseline.outputs.new_installer }}
+          CODING_HUB_INSTALL_SMOKE: '1'
+      - name: Native NSIS install, old-version upgrade and retained-data uninstall
+        if: runner.os == 'Windows'
+        run: |
+          node scripts/windows-install-smoke.mjs --old-installer "$env:OLD_INSTALLER" --new-installer "$env:NEW_INSTALLER" --output coverage/installation/windows-x64.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/build-install-baseline.mjs --verify-report coverage/installation/windows-x64.json
+        env:
+          OLD_INSTALLER: ${{ steps.installation-baseline.outputs.old_installer }}
+          NEW_INSTALLER: ${{ steps.installation-baseline.outputs.new_installer }}
+          CODING_HUB_INSTALL_SMOKE: '1'
+      - name: Remove only the owned historical installer fixture
+        if: always() && steps.installation-baseline.outputs.root != ''
+        run: node scripts/build-install-baseline.mjs --cleanup
+        env:
+          CODING_HUB_BASELINE_ROOT: ${{ steps.installation-baseline.outputs.root }}
+          CODING_HUB_INSTALL_SMOKE: '1'
       - name: Installer checksums
         run: node scripts/checksums.mjs
       - uses: actions/upload-artifact@v4
@@ -51,6 +85,7 @@ jobs:
             test-results/
             playwright-report/
             coverage/benchmarks/
+            coverage/installation/
           retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
