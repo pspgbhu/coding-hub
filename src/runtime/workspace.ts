@@ -675,18 +675,13 @@ export class WorkspaceService {
     if (typeof query !== 'string' || query.length > 500)
       throw new WorkspaceError('INVALID_PATH', 'Search text must contain at most 500 characters')
     const location = await fs.realpath(root)
-    let files: string[]
-    let repository: string | null = null
+    let files: string[] = []
+    let listed = false
     let hasGit = true
     try {
-      repository = await this.repositoryRoot(location)
-    } catch (error) {
-      if (!(error instanceof WorkspaceError) || !error.message.startsWith('Git was not found'))
-        throw error
-      hasGit = false
-    }
-    if (repository) {
-      const result = await this.requireGit(location, [
+      // ls-files already establishes whether this is a repository. Avoid a
+      // redundant rev-parse process on every keystroke, while listing afresh.
+      const result = await this.git(location, [
         'ls-files',
         '--cached',
         '--others',
@@ -695,8 +690,21 @@ export class WorkspaceService {
         '--',
         '.',
       ])
-      files = [...new Set(result.stdout.split('\0').filter(Boolean))]
-    } else if (hasGit) {
+      if (result.code === 0) {
+        files = [...new Set(result.stdout.split('\0').filter(Boolean))]
+        listed = true
+      } else if (await this.repositoryRoot(location)) {
+        throw new WorkspaceError(
+          'GIT_ERROR',
+          redactDiagnostics(result.stderr.trim() || result.stdout.trim() || 'Git command failed'),
+        )
+      }
+    } catch (error) {
+      if (!(error instanceof WorkspaceError) || !error.message.startsWith('Git was not found'))
+        throw error
+      hasGit = false
+    }
+    if (!listed && hasGit) {
       // A temporary empty index lets Git apply its own ignore semantics without initializing
       // or modifying the user's non-repository directory, or running configured templates.
       const gitDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-hub-search-'))
@@ -717,8 +725,7 @@ export class WorkspaceService {
       } finally {
         await fs.rm(gitDirectory, { recursive: true, force: true })
       }
-    } else {
-      files = []
+    } else if (!listed) {
       const visit = async (relative: string): Promise<void> => {
         if (content && files.length >= MAX_SEARCH_FILES) return
         for (const entry of await fs.readdir(path.join(location, relative), {
@@ -734,14 +741,31 @@ export class WorkspaceService {
       await visit('')
     }
     const needle = query.toLocaleLowerCase()
-    const results: SearchResult[] = []
-    const candidates = content ? files.slice(0, MAX_SEARCH_FILES) : files
-    for (const file of candidates.sort()) {
-      if (results.length >= MAX_SEARCH_RESULTS) break
-      if (!content) {
-        if (file.toLocaleLowerCase().includes(needle)) results.push({ path: file })
-        continue
+    if (!content) {
+      if (!needle)
+        return files
+          .sort()
+          .slice(0, MAX_SEARCH_RESULTS)
+          .map((path) => ({ path }))
+      const matches: string[] = []
+      for (const file of files) {
+        if (!file.toLocaleLowerCase().includes(needle)) continue
+        matches.push(file)
+        if (matches.length > MAX_SEARCH_RESULTS) break
       }
+      // Narrow queries sort only their matches. Broad queries retain the bounded
+      // case-folding work of the original sorted scan instead of folding 50k names.
+      if (matches.length <= MAX_SEARCH_RESULTS) return matches.sort().map((path) => ({ path }))
+      const results: SearchResult[] = []
+      for (const file of files.sort()) {
+        if (file.toLocaleLowerCase().includes(needle)) results.push({ path: file })
+        if (results.length >= MAX_SEARCH_RESULTS) break
+      }
+      return results
+    }
+    const results: SearchResult[] = []
+    for (const file of files.slice(0, MAX_SEARCH_FILES).sort()) {
+      if (results.length >= MAX_SEARCH_RESULTS) break
       if (!needle) continue
       try {
         const value = await this.readFile(location, file)

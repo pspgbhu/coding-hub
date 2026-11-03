@@ -243,6 +243,44 @@ describe('canonical repositories and bounded search', () => {
     ])
   })
 
+  it('keeps filename results fresh when files and ignore rules change between queries', async () => {
+    await gitAt(root, 'init', '-b', 'main', '--template=')
+    await fs.writeFile(path.join(root, 'first-result.ts'), 'first')
+    expect(await service.searchFiles(root, 'RESULT')).toEqual([{ path: 'first-result.ts' }])
+    await fs.writeFile(path.join(root, 'next-result.ts'), 'new')
+    expect(await service.searchFiles(root, 'result')).toEqual([
+      { path: 'first-result.ts' },
+      { path: 'next-result.ts' },
+    ])
+    await fs.rm(path.join(root, 'first-result.ts'))
+    expect(await service.searchFiles(root, 'result')).toEqual([{ path: 'next-result.ts' }])
+    await fs.writeFile(path.join(root, '.gitignore'), 'next-result.ts\n')
+    expect(await service.searchFiles(root, 'result')).toEqual([])
+    await fs.writeFile(path.join(root, '.gitignore'), '')
+    expect(await service.searchFiles(root, 'result')).toEqual([{ path: 'next-result.ts' }])
+  })
+
+  it('preserves ordered bounded results for narrow, broad and empty filename queries', async () => {
+    await gitAt(root, 'init', '-b', 'main', '--template=')
+    await fs.writeFile(path.join(root, 'FILE_A.ts'), '')
+    for (let group = 0; group < 11; group++)
+      await Promise.all(
+        Array.from({ length: 50 }, (_, offset) =>
+          fs.writeFile(
+            path.join(root, `file-${String(group * 50 + offset).padStart(5, '0')}.ts`),
+            '',
+          ),
+        ),
+      )
+    expect(await service.searchFiles(root, 'FILE-00549')).toEqual([{ path: 'file-00549.ts' }])
+    const broad = await service.searchFiles(root, 'FILE')
+    expect(broad).toHaveLength(500)
+    expect(broad[0]).toEqual({ path: 'FILE_A.ts' })
+    expect(broad[1]).toEqual({ path: 'file-00000.ts' })
+    expect(broad.at(-1)).toEqual({ path: 'file-00498.ts' })
+    expect(await service.searchFiles(root, '')).toEqual(broad)
+  })
+
   it('rejects a commit when staged contents changed after the review preview', async () => {
     await repository()
     await fs.writeFile(path.join(root, 'file.txt'), 'previewed')
