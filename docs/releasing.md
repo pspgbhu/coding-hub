@@ -70,19 +70,21 @@ macOS 两种架构共用 macOS 签名身份，Windows 使用自己的证书。�
 
 `.github/workflows/ci.yml` 配置 macOS x64、macOS arm64 和原生 Windows x64 的检查、内部打包、packaged E2E、原生安装升级验证与校验和。`.github/workflows/release.yml` 是手动触发的签名候选构建，输出带平台标识的 Actions artifacts。
 
-2026-11-03 的[CI run 41568623697](https://github.com/pspgbhu/coding-hub/actions/runs/41568623697)对应提交 `15bb76a`，两套原生 macOS runner 均已完成实际运行：
+2026-11-03 的[CI run 41586194047](https://github.com/pspgbhu/coding-hub/actions/runs/41586194047)对应提交 `2f016522100c667baf626e63b897b0ca528841fc`，当前 0.1.1 内部构建的三个原生架构 runner 均已完成实际运行：
 
-| 目标架构    | 单元测试                        | 源码 E2E  | 安装包 E2E | 0.1.0 安装 → 0.1.1 升级 → 卸载保留数据 |
-| ----------- | ------------------------------- | --------- | ---------- | -------------------------------------- |
-| macOS x64   | 226 项通过                      | 17 项通过 | 17 项通过  | 13 项断言通过                          |
-| macOS arm64 | 226 项通过                      | 17 项通过 | 17 项通过  | 13 项断言通过                          |
-| Windows x64 | 11 项失败，209 项通过，6 项跳过 | 未进入    | 未进入     | 未进入                                 |
+| 目标架构    | 单元测试             | 源码 E2E  | 安装包 E2E | 0.1.0 安装 → 0.1.1 升级 → 卸载保留数据 |
+| ----------- | -------------------- | --------- | ---------- | -------------------------------------- |
+| macOS x64   | 301 项通过，1 项跳过 | 17 项通过 | 17 项通过  | 13 项断言通过                          |
+| macOS arm64 | 301 项通过，1 项跳过 | 17 项通过 | 17 项通过  | 13 项断言通过                          |
+| Windows x64 | 294 项通过，8 项跳过 | 17 项通过 | 17 项通过  | 13 项断言通过                          |
 
-Windows 的进程快照和 PTY 修复等待下一轮原生 CI；不能把修复代码或本机回归视为 Windows 已通过。两套 macOS 通过的是内部构建和隔离安装流程，仍不代表生产签名、公证、Gatekeeper、SmartScreen、更新 feed 或人工辅助技术验收完成。
+三平台通过的是内部构建和隔离安装流程；macOS arm64 runner 为 Apple M1 虚拟机。当前结果仍不代表生产签名、公证、Gatekeeper / SmartScreen、可用更新 feed、人工辅助技术、硬件多显示器或固定专用硬件性能验收完成，也不能替代物理 arm64 硬件验收。
 
 安装基线由 `scripts/build-install-baseline.mjs` 在 `runner.temp` 的独立 worktree 构建，固定源提交为 `9610d035cab6f85232972c8f9960d7282526af68`，不会替换当前源码。报告记录当前提交、实际架构、安装路径、新旧安装器摘要及清理结果；完成后移除旧版源码和临时安装 fixture。Windows 的 `scripts/windows-install-smoke.mjs` 仅允许显式启用的 GitHub-hosted CI，拒绝已存在的应用注册、快捷方式、默认数据和安装缓存；执行真实 NSIS 安装器与卸载器，不以删除目录代替卸载成功。
 
-每个平台的 `desktop-evidence-*` artifact 包含 `coverage/installation/` 中的基线与安装 JSON、截图，以及性能报告和 E2E 证据。上述两套 macOS 安装报告均已独立核对 13 项断言、新旧摘要、实际架构与清理结果，截图中的旧历史和新版草稿 / 编辑缓冲区均可见。产物文件、CI YAML 或其他架构的成功结果不能替代本平台的运行证据。
+每个平台的 `desktop-evidence-*` artifact 包含 `coverage/installation/` 中的基线与安装 JSON、截图，以及性能报告和 E2E 证据。三套安装报告均已独立核对 13 项断言、新旧摘要、实际架构与无错误清理结果，当前截图均已实际查看，可见旧版中文历史和新版草稿 / 编辑缓冲区。当前 DMG / ZIP 已下载至 `release/validated/2f01652/macos-x64/` 与 `release/validated/2f01652/macos-arm64/`，逐文件 SHA256 与包内清单相符，DMG 摘要与同轮安装报告一致；各目录的 `verified-artifacts.json` 记录提交、run、文件字节数与摘要。Windows 当前 EXE 位于 `release/validated/2f01652/windows/`，实算 SHA256 `f90dfdf5d5c2eabe9c10ccd166796ad30b50df38e1b937f667b86bbdb9a489d2` 同时匹配校验清单、安装报告和基线报告。旧版基线安装器已由 CI 清理，其摘要仅由基线与安装报告交叉核对。产物文件、CI YAML 或其他架构的成功结果不能替代本平台的运行证据。
+
+同轮 macOS x64 / arm64 的 50,000 个真实文件快开 p95 分别为 240.09 / 130.88 ms；1,000 会话、单会话 10,000 事件的源码启动 / 首屏 100 条历史分别为 2695.2 / 278.2 ms 与 1231.3 / 147.2 ms。安装包对应值分别为 1804.0 / 964.3 ms 与 761.4 / 248.7 ms，保持原有启动 5 秒、首屏历史 1 秒门槛。fixture 构建不计入操作计时，runner 负载与缓存会影响结果，这些自动化墙钟记录不能替代固定专用硬件验收。
 
 生成校验和：
 

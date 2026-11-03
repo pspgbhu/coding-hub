@@ -54,26 +54,30 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [x] Paged history, virtual rendering, Chinese search, bounded streaming and long-output loading.
 - [x] Restricted untrusted folders: no project Agent/PTY/script execution before trust.
 - [x] Implement update state/progress/retry, release notes, explicit download/install and safe deferred restart; provide separate internal/stable build profiles and guarded signing scripts.
-- [ ] Configurable signed update workflow, progress/retry/release notes and safe deferred restart.
-- [ ] macOS x64/arm64 and Windows x64 packaged-app, install, upgrade and uninstall verification.
+- [ ] Production signing/notarization, a lasting HTTPS update feed and a verified real signed upgrade with safe deferred restart.
+- [x] macOS x64/arm64 and Windows x64 packaged-app, install, upgrade and retained-data uninstall verification on native-architecture CI at product commit `2f01652`.
 - [x] Local macOS x64 internal DMG copy/replace upgrade and removal preserve isolated user data. This excludes Gatekeeper, quarantine and production signing.
 - [x] Install/upgrade/troubleshooting/privacy/compatibility/changelog/support documentation.
 
 ## Verification gates
 
-- [ ] Typecheck, meaningful unit/service tests, build, independent three-provider UI E2E and formatting.
+- [x] Typecheck, meaningful unit/service tests, build, independent three-provider UI E2E and formatting on local macOS x64 and all three native CI targets; exact results are recorded separately.
 - [x] Fault injection: storage, save, migration, runtime/renderer crash, cancellation and permission failures on local macOS x64.
 - [x] Isolation, legacy cwd, partial/out-of-scope staging, external edits and undo protection.
 - [x] Local keyboard, themes, Monaco paint/layout, terminal reload/backpressure and 150%/200% Electron zoom checks.
-- [ ] Keyboard, themes, Monaco paint/layout, terminal reload/backpressure and high-DPI checks.
+- [x] Local native 2× HiDPI rendering evidence: display scale factor 2, Electron zoom 1, renderer DPR 2 and matching backing pixels. This does not cover physical PPI, other hardware, display migration or manual acceptance.
+- [ ] Native hardware DPI, operating-system scaling and multi-display acceptance on supported platforms.
 - [ ] Benchmark: 1,000 sessions, 10,000-event conversation, 50,000 files; startup ≤5s, first page ≤1s, search p95 ≤500ms on fixed CI hardware.
-- [ ] Native packaged dependencies, upgrade preservation, backup recovery and update-failure checks.
+- [x] Native packaged dependencies, upgrade preservation and backup recovery on all three native CI targets.
+- [ ] Production signed update-failure checks, including an invalid signature and interrupted download.
 
-The remaining release gates require actual Windows/arm64 runs, hardware DPI and
-multi-display checks, manual assistive-technology use, fixed CI measurements and
-production signing/notarization/feed upgrade success and failure. CI configuration
-and mocked updater tests cannot close these gates. Local evidence and runnable
-commands are retained in the verification record.
+Product commit `2f01652` passed the complete native CI matrix, including actual
+old-version installation, upgrade and retained-data uninstall. The remaining
+release gates require hardware DPI and multi-display checks, manual assistive-
+technology use, fixed dedicated CI measurements and production signing/
+notarization/feed upgrade success and failure. Native-architecture hosted runners
+and mocked updater tests cannot close these gates. Evidence and runnable commands
+are retained in the verification record.
 
 Live account tests remain opt-in. Cloud sync, team accounts, remote execution,
 Linux/WSL, extension marketplace, a full LSP, automatic cross-Agent handoffs and
