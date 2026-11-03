@@ -284,31 +284,78 @@ describe('task lifecycle and persistence boundaries', () => {
     const workspace = randomUUID()
     const readRun = async (id: string): Promise<TaskRun> =>
       JSON.parse(await fs.readFile(join(data, 'tasks', `${id}.json`), 'utf8'))
+    const completion = (phase: string) => {
+      const started = performance.now()
+      let receive!: (run: TaskRun) => void
+      const completed = new Promise<TaskRun>((resolve) => {
+        receive = (run) => {
+          const diagnostic = /\[(?:PROCESS_CLEANUP_FAILED|TASK_RESULT_SAVE_FAILED)\]/.test(
+            run.output,
+          )
+          if (run.status === 'running' && !diagnostic) return
+          process.stdout.write(
+            '[task lifecycle fixture] ' +
+              JSON.stringify({
+                platform: process.platform,
+                phase,
+                elapsedMs: performance.now() - started,
+                status: run.status,
+                output: run.output,
+              }) +
+              '\n',
+          )
+          // Surface cleanup/persistence diagnostics immediately rather than waiting
+          // out the case deadline with an unexplained running state.
+          resolve(run)
+        }
+      })
+      return { completed, receive }
+    }
+    let lifecycle = completion('missing-cwd')
+    tasks = new TaskService((run) => lifecycle.receive(run))
     const failed = await tasks.run(
       join(root, 'missing'),
       data,
       workspace,
       definition('process.exit(0)'),
     )
-    // Natural exit waits for verified process-tree cleanup, then atomically persists the
-    // terminal state. A 1s UI-poll deadline can race legitimate cleanup under parallel CI.
-    await expect
-      .poll(async () => (await readRun(failed.id)).status, { timeout: 8000 })
-      .toBe('failed')
-    const failedResult = await readRun(failed.id)
+    // The final event follows verified native cleanup and the persistence attempt.
+    // Both lifecycles share the existing 15s case deadline; no UI poll cuts either short.
+    const failedResult = await lifecycle.completed
+    expect(failedResult).toMatchObject({ id: failed.id, status: 'failed' })
+    expect(failedResult.output).not.toMatch(
+      /\[(?:PROCESS_CLEANUP_FAILED|TASK_RESULT_SAVE_FAILED)\]/,
+    )
+    expect(await readRun(failed.id)).toEqual(failedResult)
     expect(failedResult.exitCode).toBeTypeOf('number')
     expect(failedResult.exitCode).not.toBe(0)
     expect(failedResult.finishedAt).toBeGreaterThanOrEqual(failed.startedAt)
     expect(failedResult.output).toMatch(/ENOENT|not found|no such/i)
     // The failed attempt must release the workspace so a real command can run next.
-    const run = await tasks.run(root, data, workspace, definition('process.exit(0)'))
-    await expect.poll(async () => (await readRun(run.id)).status, { timeout: 8000 }).toBe('passed')
-    expect(await readRun(run.id)).toMatchObject({ id: run.id, status: 'passed', exitCode: 0 })
-    expect((await readRun(run.id)).finishedAt).toBeGreaterThanOrEqual(run.startedAt)
-    expect((await tasks.list(data, workspace)).find((entry) => entry.id === run.id)).toMatchObject({
+    lifecycle = completion('valid-retry')
+    const marker = join(root, 'spawn-retry-executed')
+    const launch = vi.spyOn(processes, 'launch')
+    const run = await tasks.run(
+      root,
+      data,
+      workspace,
+      definition(
+        `require('fs').writeFileSync(${JSON.stringify(marker)},'retried');console.log('spawn retry completed');process.exit(0)`,
+      ),
+    )
+    expect(launch.mock.calls.filter(([command]) => command === process.execPath)).toHaveLength(1)
+    const result = await lifecycle.completed
+    expect(result).toMatchObject({
+      id: run.id,
       status: 'passed',
       exitCode: 0,
     })
+    expect(result.output).toContain('spawn retry completed')
+    expect(result.output).not.toMatch(/\[(?:PROCESS_CLEANUP_FAILED|TASK_RESULT_SAVE_FAILED)\]/)
+    expect(result.finishedAt).toBeGreaterThanOrEqual(run.startedAt)
+    expect(await fs.readFile(marker, 'utf8')).toBe('retried')
+    expect(await readRun(run.id)).toEqual(result)
+    expect((await tasks.list(data, workspace)).find((entry) => entry.id === run.id)).toEqual(result)
   })
 
   it.skipIf(process.platform === 'win32')(
