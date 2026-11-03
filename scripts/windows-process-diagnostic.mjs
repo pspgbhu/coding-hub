@@ -129,4 +129,12 @@ try {
   report.nonemptyLines = result.stdout.split(/\r?\n/).filter((line) => line.trim()).length
 }
 console.log(JSON.stringify(report))
-if (result.failure || result.exitCode !== 0) process.exitCode = 1
+if (
+  result.failure ||
+  result.exitCode !== 0 ||
+  !report.jsonParseable ||
+  !report.isArray ||
+  report.rowCount === 0 ||
+  report.invalidRows > 0
+)
+  process.exitCode = 1

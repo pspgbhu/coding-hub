@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 const require = createRequire(import.meta.url)
+require('./native-deps.cjs').stageNodePtyAssets()
 const electron = require('electron')
 const args = [resolve('node_modules/vitest/vitest.mjs'), 'run', ...process.argv.slice(2)]
 const result = spawnSync(electron, args, {

@@ -13,6 +13,7 @@ files:
   - '!node_modules/@anthropic-ai/claude-agent-sdk-*/**/*'
   - '!node_modules/monaco-editor/**/*'
 asar: true
+afterExtract: scripts/native-deps.cjs
 asarUnpack:
   - '**/*.node'
   - '**/node-pty/**'

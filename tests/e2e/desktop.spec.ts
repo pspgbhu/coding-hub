@@ -288,11 +288,16 @@ test('visible backup restore replaces drafts and unsaved editor state without cl
   await page.getByRole('button', { name: /^设置/ }).first().click()
   await settings.getByRole('button', { name: '数据与更新', exact: true }).click()
   page.once('dialog', (dialog) => dialog.accept())
-  await settings
-    .locator('.management-row')
-    .filter({ hasText: '手动' })
-    .getByRole('button', { name: '恢复', exact: true })
-    .click()
+  // Restore deliberately reloads this same URL to replace the preload data generation.
+  // Arm the new-document barrier before clicking so no API poll runs in the old context.
+  await Promise.all([
+    page.waitForEvent('domcontentloaded'),
+    settings
+      .locator('.management-row')
+      .filter({ hasText: '手动' })
+      .getByRole('button', { name: '恢复', exact: true })
+      .click(),
+  ])
   await expect
     .poll(async () => (await page.evaluate((id) => window.hub.getDraft(id), session.id)).text)
     .toBe('DRAFT_BEFORE_BACKUP')

@@ -85,7 +85,7 @@ function readWindowsSnapshot(): Promise<ProcessIdentity[]> {
       [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);
       while ($null -ne ($request=[Console]::ReadLine())) {
         if ($request -ne 'snapshot') { exit 1 };
-        $result=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Where-Object { $_.CreationDate } | ForEach-Object { [pscustomobject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().Ticks.ToString()} });
+        $result=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Where-Object { $_.ProcessId -gt 0 -and $_.CreationDate } | ForEach-Object { [pscustomobject]@{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$_.CreationDate.ToUniversalTime().Ticks.ToString()} });
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($result) -Compress));
         [Console]::Out.Flush();
       }

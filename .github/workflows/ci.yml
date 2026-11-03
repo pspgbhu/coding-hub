@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - name: Diagnose Windows process identity shapes without process names or arguments
+      - name: Validate Windows process identities without process names or arguments
         if: runner.os == 'Windows'
         run: node scripts/windows-process-diagnostic.mjs
       - run: pnpm install --frozen-lockfile
