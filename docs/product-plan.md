@@ -7,10 +7,11 @@ remains part of the goal; optional future distribution work is listed separately
 The owner clarified that the current product is for personal use. Use the existing
 `internal` build and manual updates. A Developer ID / production signing certificate,
 Apple notarization identity and production update feed are not required for this
-delivery mode. This changes distribution requirements, not the verification status
-of accessibility, physical hardware or performance.
+delivery mode. The owner has also explicitly deferred the three manual/hardware
+acceptance items listed below. They remain unverified and are not prerequisites
+for the current personal-use delivery.
 
-Updated 2026-11-03. Checked implementation items below have local macOS x64
+Updated 2026-11-04. Checked implementation items below have local macOS x64
 unit/service or UI evidence. They do not imply that every supported platform,
 production signing, real accounts or manual accessibility have been accepted.
 See [verification](verification.md) for commands, measurements and boundaries.
@@ -51,7 +52,6 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [x] Multiple terminals with attach/replay/search/context and clear create/restart/terminate controls. Live PTYs survive panel/session changes and renderer reload; process exit is not terminal persistence.
 - [x] Resizable persistent layout, fonts/indent/send-key settings and command palette.
 - [x] Core workflows expose keyboard navigation, named controls, focus and status announcements, with automated coverage.
-- [ ] Manual screen-reader acceptance on supported platforms, including VoiceOver and NVDA.
 
 ## E — Maintenance and release
 
@@ -61,7 +61,7 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [x] Restricted untrusted folders: no project Agent/PTY/script execution before trust.
 - [x] Implement update state/progress/retry, release notes, explicit download/install and safe deferred restart; provide separate internal/stable build profiles and guarded signing scripts.
 - [x] Personal-use internal builds and manual replacement upgrades preserve data without requiring production signing, notarization or an update feed.
-- [x] macOS x64/arm64 and Windows x64 packaged-app, install, upgrade and retained-data uninstall verification on native-architecture CI at product commit `2f01652`.
+- [x] macOS x64/arm64 and Windows x64 packaged-app, install, upgrade and retained-data uninstall verification on native-architecture CI at product commit `cc1d8db`.
 - [x] Local macOS x64 internal DMG copy/replace upgrade and removal preserve isolated user data. This excludes Gatekeeper, quarantine and production signing.
 - [x] Install/upgrade/troubleshooting/privacy/compatibility/changelog/support documentation.
 
@@ -72,16 +72,24 @@ See [verification](verification.md) for commands, measurements and boundaries.
 - [x] Isolation, legacy cwd, partial/out-of-scope staging, external edits and undo protection.
 - [x] Local keyboard, themes, Monaco paint/layout, terminal reload/backpressure and 150%/200% Electron zoom checks.
 - [x] Local native 2× HiDPI rendering evidence: display scale factor 2, Electron zoom 1, renderer DPR 2 and matching backing pixels. This does not cover physical PPI, other hardware, display migration or manual acceptance.
-- [ ] Native hardware DPI, operating-system scaling and multi-display acceptance on supported platforms.
-- [ ] Benchmark: 1,000 sessions, 10,000-event conversation, 50,000 files; startup ≤5s, first page ≤1s, search p95 ≤500ms on fixed CI hardware.
 - [x] Native packaged dependencies, upgrade preservation and backup recovery on all three native CI targets.
 
-Product commit `2f01652` passed the complete native CI matrix, including actual
-old-version installation, upgrade and retained-data uninstall. The remaining
-quality gates require hardware DPI and multi-display checks, manual assistive-
-technology use and fixed dedicated CI measurements. Native-architecture hosted
-runners do not close these gates. Evidence and runnable commands are retained in
-the verification record.
+Product commit `cc1d8db` passed the complete native CI matrix, including actual
+old-version installation, upgrade and retained-data uninstall. Current personal-use
+implementation and automated verification items above are complete. Evidence and
+runnable commands are retained in the verification record; this does not imply
+acceptance of the deferred items below.
+
+## Deferred acceptance — owner request
+
+The owner explicitly deferred these three items. They remain unverified, rather
+than passed, and do not block the current personal-use delivery:
+
+| Acceptance item                                                                                                                                | Status and retained evidence                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Manual screen-reader acceptance, including VoiceOver and NVDA                                                                                  | Deferred; manual acceptance not performed. Automated keyboard, names, focus and status coverage remains valid.                   |
+| Native hardware DPI, operating-system scaling and multi-display acceptance                                                                     | Deferred; local native 2× and automated zoom evidence remain valid but do not establish a physical device matrix.                |
+| Fixed dedicated CI hardware benchmark: 1,000 sessions, 10,000-event conversation, 50,000 files; startup ≤5s, first page ≤1s, search p95 ≤500ms | Deferred; the complete hosted-runner benchmarks passed the same thresholds, without proving fixed dedicated hardware acceptance. |
 
 ## Optional future public distribution
 

@@ -2,7 +2,7 @@
 
 面向个人开发者的本地多 Agent 编程工作台。连接已安装的 Claude Code、Codex CLI 和 OpenCode，在一个桌面应用中完成任务、代码审阅、检查和 Git 交付。
 
-当前代码版本为 **0.1.1**，正在按 [1.0 产品交付清单](docs/product-plan.md) 完善。当前按纯自用交付：使用 `internal` 构建并手动更新，无需真实发行证书、公证身份或生产更新源。签名发行候选保留为未来对外分发的可选流程；实际验证与尚未完成的质量验收见 [验证记录](docs/verification.md)。
+当前代码版本为 **0.1.1**，按 [产品交付清单](docs/product-plan.md) 交付自用版本：使用 `internal` 构建并手动更新，无需真实发行证书、公证身份或生产更新源。签名发行候选保留为未来对外分发的可选流程；实际验证与用户暂缓的三项质量验收见 [验证记录](docs/verification.md)。
 
 ![Coding Hub 工作台](docs/images/workspace-dark.png)
 
