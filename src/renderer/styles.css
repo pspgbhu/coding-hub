@@ -1,25 +1,25 @@
 :root {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif;
   color-scheme: light;
-  --bg: #fafaf8;
-  --main: #fdfdfb;
-  --sidebar: #f0f0ed;
+  --bg: #fafafa;
+  --main: #fff;
+  --sidebar: #f5f5f5;
   --surface: #fff;
-  --hover: #e9eae5;
-  --selected: #e1e5de;
-  --border: #e4e5de;
-  --border-strong: #d3d6cc;
-  --text: #292e28;
-  --muted: #858b80;
-  --secondary: #646c60;
-  --accent: #52765c;
-  --accent-hover: #42634c;
+  --hover: #ebebeb;
+  --selected: #e5e5e5;
+  --border: #e5e5e5;
+  --border-strong: #ccc;
+  --text: #171717;
+  --muted: #737373;
+  --secondary: #525252;
+  --accent: #171717;
+  --accent-hover: #333;
   --accent-text: #fff;
-  --accent-soft: #e8efe5;
-  --terminal-bg: #f5f5f1;
-  --warning: #a77940;
-  --error: #b35f56;
-  --shadow: 0 12px 56px #27331e17;
+  --accent-soft: #ededed;
+  --terminal-bg: #fafafa;
+  --warning: #525252;
+  --error: #171717;
+  --shadow: 0 8px 32px #00000014;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -27,24 +27,24 @@
 }
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #1c1e1b;
-  --main: #20221f;
-  --sidebar: #191c18;
-  --surface: #282b26;
-  --hover: #2c3029;
-  --selected: #343b30;
-  --border: #32382f;
-  --border-strong: #444d3e;
-  --text: #e0e5da;
-  --muted: #7e8977;
-  --secondary: #a3ad9b;
-  --accent: #b6cba4;
-  --accent-hover: #c5d6b6;
-  --accent-text: #25311f;
-  --accent-soft: #303a29;
-  --terminal-bg: #191c18;
-  --warning: #d0aa72;
-  --error: #df9080;
+  --bg: #171717;
+  --main: #1a1a1a;
+  --sidebar: #141414;
+  --surface: #222;
+  --hover: #2a2a2a;
+  --selected: #333;
+  --border: #303030;
+  --border-strong: #454545;
+  --text: #ededed;
+  --muted: #929292;
+  --secondary: #b5b5b5;
+  --accent: #ededed;
+  --accent-hover: #d4d4d4;
+  --accent-text: #171717;
+  --accent-soft: #2a2a2a;
+  --terminal-bg: #141414;
+  --warning: #b5b5b5;
+  --error: #ededed;
   --shadow: 0 15px 60px #0005;
 }
 * {
@@ -120,7 +120,7 @@ kbd {
   white-space: nowrap;
 }
 ::selection {
-  background: #a4b79450;
+  background: color-mix(in srgb, var(--text) 18%, transparent);
 }
 ::-webkit-scrollbar {
   width: 6px;
@@ -217,12 +217,12 @@ kbd {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: #7ea56b;
+  background: var(--secondary);
   flex-shrink: 0;
-  box-shadow: 0 0 0 2px #7ea56b0d;
 }
 .status-dot.off {
   background: var(--muted);
+  opacity: 0.35;
   box-shadow: none;
 }
 .provider-dot {
@@ -329,8 +329,8 @@ kbd {
   background: var(--hover);
 }
 .window-controls .window-close:hover {
-  background: #be5149;
-  color: white;
+  background: var(--selected);
+  color: var(--text);
 }
 .app-body {
   display: flex;
@@ -634,61 +634,36 @@ kbd {
   display: flex;
   flex-direction: column;
   overflow: auto;
-  padding: 0 42px;
+  padding: 40px;
 }
 .home-content {
-  margin: auto;
-  max-width: 740px;
+  margin: 0 auto;
+  max-width: 640px;
   width: 100%;
-  padding: 55px 0 55px;
-  transform: translateY(-8px);
+  padding: 32px 0;
 }
-.home-eyebrow {
-  font-size: 9px;
-  letter-spacing: 2.5px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 9px;
-  margin-bottom: 32px;
-}
-.home-logo {
-  height: 68px;
-  width: 68px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin: 0 auto 26px;
-  border: 1px solid var(--border-strong);
-  background: var(--accent-soft);
-  color: var(--accent);
-  border-radius: 20px;
-  box-shadow: inset 0 1px #ffffff0a;
-}
+
 .home h1 {
-  font-size: 31px;
-  font-weight: 550;
-  letter-spacing: -1.3px;
-  text-align: center;
-  margin: 0 0 19px;
+  font-size: 20px;
+  font-weight: 600;
+  text-align: left;
+  margin: 0 0 8px;
   line-height: 1.5;
 }
 .home-description {
-  text-align: center;
+  text-align: left;
   font-size: 12px;
-  line-height: 1.95;
+  line-height: 1.7;
   color: var(--secondary);
-  margin: 0 0 29px;
+  margin: 0 0 20px;
 }
 .home-action {
-  height: 41px;
-  padding: 0 19px;
-  margin: 0 auto;
+  height: 35px;
+  padding: 0 13px;
+  margin: 0;
   display: flex;
   width: max-content;
   gap: 10px;
-  box-shadow: 0 3px 9px #23321b0b;
   font-size: 12px;
 }
 .home-action > svg:last-child {
@@ -698,7 +673,7 @@ kbd {
 .home-project {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 6px;
   font-size: 10px;
   color: var(--muted);
@@ -712,22 +687,22 @@ kbd {
 }
 .home-agents {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
   gap: 0;
-  margin: 61px auto 0;
-  padding-top: 23px;
+  margin: 32px 0 0;
+  padding-top: 12px;
   border-top: 1px solid var(--border);
-  max-width: 585px;
+  max-width: 100%;
 }
 .agent-readiness {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 20px;
+  padding: 12px;
   text-align: left;
   border-radius: 7px;
-  flex: 1;
-  justify-content: center;
+  width: 100%;
+  justify-content: flex-start;
 }
 .agent-readiness:hover {
   background: var(--hover);
@@ -744,60 +719,25 @@ kbd {
 }
 .agent-readiness strong {
   display: block;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
   white-space: nowrap;
 }
 .agent-readiness small {
   display: block;
-  font-size: 9px;
+  font-size: 11px;
   color: var(--muted);
   margin-top: 3px;
-  max-width: 105px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .agent-readiness > .status-dot,
 .agent-readiness > .spin {
-  margin-left: 4px;
+  margin-left: auto;
 }
-.home-principles {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 25px;
-  margin-top: 27px;
-  font-size: 9px;
-  color: var(--muted);
-}
-.home-principles span {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.home-principles svg {
-  opacity: 0.7;
-}
-.home-bottom {
-  padding: 19px 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 10px;
-  flex-shrink: 0;
-}
-.home-bottom button {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--secondary);
-}
-.home-bottom button:hover {
-  color: var(--accent);
-}
+
 .conversation-toolbar {
   display: flex;
   align-items: center;
@@ -896,26 +836,15 @@ kbd {
   color: var(--muted);
 }
 .session-welcome {
-  padding: 65px 0 0;
+  padding: 32px 0 0;
   max-width: 540px;
   margin: 0 auto;
 }
-.welcome-symbol {
-  width: 42px;
-  height: 42px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 23px;
-}
+
 .session-welcome h2 {
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 550;
-  letter-spacing: -0.7px;
-  margin: 0 0 15px;
+  margin: 0 0 10px;
 }
 .session-welcome p {
   font-size: 12px;
@@ -926,7 +855,7 @@ kbd {
 .prompt-suggestions {
   display: flex;
   flex-direction: column;
-  margin-top: 35px;
+  margin-top: 24px;
   gap: 8px;
   max-width: 420px;
 }
@@ -1887,8 +1816,7 @@ kbd {
 .dialog-overlay {
   position: fixed;
   inset: 0;
-  background: #11180e70;
-  backdrop-filter: blur(4px);
+  background: #00000066;
   z-index: 100;
   animation: fadein 0.15s;
 }
@@ -2367,23 +2295,12 @@ kbd {
   .sidebar {
     width: 255px;
   }
-  .home h1 {
-    font-size: 34px;
-  }
-  .home-description {
-    font-size: 13px;
-  }
-  .home-content {
-    max-width: 800px;
-  }
+
   .conversation {
     padding-top: 42px;
   }
   .conversation-toolbar {
     padding: 0 35px;
-  }
-  .home-agents {
-    margin-top: 72px;
   }
 }
 @media (max-width: 1150px) {
@@ -2398,54 +2315,19 @@ kbd {
     box-shadow: -12px 0 40px #0000000b;
   }
   .home {
-    padding: 0 30px;
+    padding: 24px;
   }
-  .home h1 {
-    font-size: 28px;
-  }
+
   .agent-readiness {
     padding: 9px 11px;
     gap: 8px;
   }
-  .home-agents {
-    max-width: 515px;
-  }
+
   .conversation-heading strong {
     max-width: 300px;
   }
 }
 @media (max-height: 780px) {
-  .home-content {
-    padding-top: 30px;
-    padding-bottom: 30px;
-    transform: none;
-  }
-  .home-eyebrow {
-    margin-bottom: 22px;
-  }
-  .home-logo {
-    height: 57px;
-    width: 57px;
-    border-radius: 17px;
-    margin-bottom: 20px;
-  }
-  .home h1 {
-    font-size: 27px;
-    margin-bottom: 13px;
-  }
-  .home-description {
-    margin-bottom: 21px;
-  }
-  .home-agents {
-    margin-top: 37px;
-    padding-top: 18px;
-  }
-  .home-principles {
-    margin-top: 18px;
-  }
-  .home-bottom {
-    padding: 14px 0;
-  }
   .session-welcome {
     padding-top: 35px;
   }

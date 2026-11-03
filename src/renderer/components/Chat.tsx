@@ -15,7 +15,6 @@ import {
   MessageCircleQuestion,
   X,
   FileCode2,
-  Sparkles,
   RotateCcw,
 } from 'lucide-react'
 import { PROVIDERS, type AgentEvent, type Session, type ProviderInfo } from '../../shared/types'
@@ -313,33 +312,23 @@ export default function Chat({
           ) : events.filter((event) => !['session', 'status', 'done', 'usage'].includes(event.kind))
               .length === 0 ? (
             <div className="session-welcome">
-              <div className="welcome-symbol">
-                <Sparkles size={26} />
-              </div>
-              <h2>从一个想法开始</h2>
-              <p>
-                描述你想实现的功能，或让 {session ? PROVIDERS[session.provider].name : 'Agent'}{' '}
-                帮你理解代码。
-                <br />
-                它将在当前项目中读取文件、执行命令并完成修改。
-              </p>
+              <h2>新会话</h2>
+              <p>输入任务，Agent 将在当前项目中执行。</p>
               <div className="prompt-suggestions">
-                {[
-                  '帮我了解这个项目的架构',
-                  '检查代码，找出可以改进的地方',
-                  '运行项目并解决发现的问题',
-                ].map((prompt) => (
-                  <button
-                    key={prompt}
-                    onClick={() => {
-                      setDraft(prompt)
-                      inputRef.current?.focus()
-                    }}
-                  >
-                    <span>{prompt}</span>
-                    <ArrowUp size={14} />
-                  </button>
-                ))}
+                {['说明项目结构和主要入口', '检查当前未提交的修改', '运行项目测试并报告结果'].map(
+                  (prompt) => (
+                    <button
+                      key={prompt}
+                      onClick={() => {
+                        setDraft(prompt)
+                        inputRef.current?.focus()
+                      }}
+                    >
+                      <span>{prompt}</span>
+                      <ArrowUp size={14} />
+                    </button>
+                  ),
+                )}
               </div>
             </div>
           ) : (
@@ -442,9 +431,7 @@ export default function Chat({
             ref={inputRef}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder={
-              running ? 'Agent 正在处理，完成后继续对话…' : '描述任务，交给你的 coding agent…'
-            }
+            placeholder={running ? 'Agent 正在处理，完成后继续对话…' : '输入任务…'}
             rows={2}
             disabled={!session}
             onKeyDown={(event) => {

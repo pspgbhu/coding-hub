@@ -411,8 +411,7 @@ export default function Workspace({
                   {changeFiles.length === 0 && (
                     <div className="git-clean">
                       <Check size={21} />
-                      <p>工作区很干净</p>
-                      <small>文件修改后将显示在这里</small>
+                      <p>没有文件变更</p>
                     </div>
                   )}
                   {changeFiles.map((file) => (
@@ -623,9 +622,8 @@ export default function Workspace({
             </>
           ) : (
             <div className="editor-empty">
-              <FileCode2 size={32} strokeWidth={1} />
-              <strong>代码，就在手边</strong>
-              <span>从左侧选择文件以查看和编辑</span>
+              <strong>未打开文件</strong>
+              <span>从文件列表选择文件。</span>
               <small>选中文件或代码片段，可以引用到对话</small>
             </div>
           )}

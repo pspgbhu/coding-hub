@@ -52,7 +52,7 @@ async function launch() {
   page = await app.firstWindow()
   page.on('pageerror', (error) => pageErrors.push(error.message))
   await page.waitForLoadState('domcontentloaded')
-  await expect(page.getByText('想法，从这里变成代码。')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '打开项目', exact: true })).toBeVisible()
 }
 test.beforeAll(async () => {
   location = await mkdtemp(join(tmpdir(), 'coding-hub-e2e-'))
@@ -79,6 +79,7 @@ test.afterAll(async () => {
 })
 
 test('desktop workspace connects UI → IPC → utility process → files, Git and CLI', async () => {
+  await expect(page.locator('.home-agents .spin')).toHaveCount(0)
   await page.screenshot({ path: 'test-results/welcome.png' })
   await app.evaluate(({ dialog }, selected) => {
     dialog.showOpenDialog = (async () => ({
@@ -118,8 +119,8 @@ test('desktop workspace connects UI → IPC → utility process → files, Git a
   )
   // Reload exercises bootstrap restoration rather than injecting renderer state.
   await page.reload()
-  await expect(page.getByPlaceholder('描述任务，交给你的 coding agent…')).toBeVisible()
-  await page.getByPlaceholder('描述任务，交给你的 coding agent…').fill('Say hello')
+  await expect(page.getByPlaceholder('输入任务…')).toBeVisible()
+  await page.getByPlaceholder('输入任务…').fill('Say hello')
   await page.getByRole('button', { name: '发送消息', exact: true }).click()
   await expect(
     page.getByText('Hello from the real IPC and CLI transport. 中文流式输出。', { exact: true }),
@@ -133,7 +134,7 @@ test('desktop workspace connects UI → IPC → utility process → files, Git a
   const view = await page.evaluate((id) => window.hub.getSession(id), session.id)
   expect(view.session.nativeId).toBe('fixture-thread')
   expect(view.events.filter((e) => e.kind === 'text')).toHaveLength(1)
-  await page.getByPlaceholder('描述任务，交给你的 coding agent…').fill('approval')
+  await page.getByPlaceholder('输入任务…').fill('approval')
   await page.getByRole('button', { name: '发送消息', exact: true }).click()
   await expect(page.getByText('需要你的授权', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '允许一次', exact: true }).click()
@@ -167,6 +168,7 @@ test('desktop workspace connects UI → IPC → utility process → files, Git a
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await page.getByRole('button', { name: '切换代码工作区' }).click()
   await page.getByText('hello.ts', { exact: true }).first().click()
+  await expect(page.locator('.monaco-editor .view-lines').first()).toContainText('updated')
   await page.screenshot({ path: 'test-results/workspace-dark.png' })
 })
 

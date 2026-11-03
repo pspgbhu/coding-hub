@@ -385,7 +385,7 @@ function createWindow(): void {
     minHeight: 650,
     show: false,
     title: 'Coding Hub',
-    backgroundColor: '#151719',
+    backgroundColor: '#171717',
     titleBarStyle: 'hidden',
     trafficLightPosition: { x: 16, y: 18 },
     autoHideMenuBar: true,
@@ -416,9 +416,11 @@ function createWindow(): void {
 }
 function setupTray(): void {
   const icon = nativeImage.createFromPath(join(app.getAppPath(), 'build/tray.png'))
-  tray = new Tray(
-    icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 18, height: 18 }),
-  )
+  const trayIcon = icon.isEmpty()
+    ? nativeImage.createEmpty()
+    : icon.resize({ width: 18, height: 18 })
+  if (process.platform === 'darwin') trayIcon.setTemplateImage(true)
+  tray = new Tray(trayIcon)
   tray.setToolTip('Coding Hub · 编程工作台')
   tray.setContextMenu(
     Menu.buildFromTemplate([

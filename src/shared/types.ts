@@ -176,7 +176,7 @@ export interface AppAPI {
   onSessionsChanged(callback: () => void): () => void
 }
 export const PROVIDERS: Record<ProviderId, { name: string; color: string; command: string }> = {
-  claude: { name: 'Claude Code', color: '#d79573', command: 'claude' },
-  codex: { name: 'Codex', color: '#8cbfa5', command: 'codex' },
-  opencode: { name: 'OpenCode', color: '#a8b5e5', command: 'opencode' },
+  claude: { name: 'Claude Code', color: 'var(--secondary)', command: 'claude' },
+  codex: { name: 'Codex', color: 'var(--secondary)', command: 'codex' },
+  opencode: { name: 'OpenCode', color: 'var(--secondary)', command: 'opencode' },
 }

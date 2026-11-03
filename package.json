@@ -1,6 +1,6 @@
 {
   "name": "coding-hub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local-first desktop workspace for your coding agents",
   "main": "./out/main/index.js",
   "author": "Coding Hub contributors",

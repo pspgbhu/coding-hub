@@ -1,7 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import {
-  Activity,
   Archive,
   ArrowRight,
   Check,
@@ -10,8 +9,6 @@ import {
   ExternalLink,
   Folder,
   FolderOpen,
-  GitBranch,
-  Laptop,
   LoaderCircle,
   MessageSquare,
   Monitor,
@@ -108,30 +105,22 @@ function EmptyState({
   return (
     <div className="home">
       <div className="home-content">
-        <div className="home-eyebrow">
-          <span className="status-dot" />
-          YOUR LOCAL CODING WORKSPACE
-        </div>
-        <div className="home-logo">
-          <Code2 size={32} strokeWidth={1.5} />
-        </div>
-        <h1>想法，从这里变成代码。</h1>
+        <h1>{project ? '项目会话' : '打开项目'}</h1>
         <p className="home-description">
-          一个安静、专注的工作台。
-          <br />
-          连接你熟悉的 coding agent，在本地项目里一起工作。
+          {project ? '在当前项目中创建会话。' : '选择本地目录，然后创建会话。'}
         </p>
         <button
           className="button primary home-action"
           onClick={project ? createSession : addProject}
         >
           {project ? <Plus size={17} /> : <FolderOpen size={17} />}
-          {project ? '开始一个新会话' : '打开项目'}
+          {project ? '新建会话' : '打开项目'}
           <ArrowRight size={16} />
         </button>
         {project && (
           <div className="home-project">
             <Folder size={13} />
+            <strong>{project.name}</strong>
             <span>{shortPath(project.path)}</span>
           </div>
         )}
@@ -162,25 +151,6 @@ function EmptyState({
             )
           })}
         </div>
-        <div className="home-principles">
-          <span>
-            <Laptop size={13} />
-            本地运行
-          </span>
-          <span>
-            <GitBranch size={13} />
-            原生 CLI 上下文
-          </span>
-          <span>
-            <Activity size={13} />多 Agent 工作流
-          </span>
-        </div>
-      </div>
-      <div className="home-bottom">
-        <span>你的项目，你的工具，你的节奏。</span>
-        <button onClick={openSettings}>
-          配置 Agent <ArrowRight size={12} />
-        </button>
       </div>
     </div>
   )
@@ -588,7 +558,7 @@ export default function App() {
           {booting ? (
             <>
               <LoaderCircle size={24} className="spin" />
-              <p>准备你的工作台…</p>
+              <p>正在启动…</p>
             </>
           ) : (
             <>
@@ -603,7 +573,6 @@ export default function App() {
             </>
           )}
         </div>
-        <small>LOCAL FIRST · BUILT FOR BUILDERS</small>
       </div>
     )
   return (
@@ -751,8 +720,8 @@ export default function App() {
                       : archived
                         ? '暂无已归档会话'
                         : project
-                          ? '开始一场新的对话'
-                          : '打开项目后开始会话'}
+                          ? '暂无会话'
+                          : '先打开项目'}
                   </div>
                 ) : (
                   filteredSessions.map((item) => (
@@ -952,7 +921,7 @@ export default function App() {
         open={newOpen}
         onOpenChange={setNewOpen}
         title="新建会话"
-        description={`在 ${project?.name || '项目'} 中开始工作`}
+        description={`为 ${project?.name || '当前项目'} 创建会话。`}
       >
         <div className="new-session-body">
           <label className="field-label">选择 coding agent</label>
@@ -1019,7 +988,7 @@ export default function App() {
               placeholder="使用 CLI 配置"
             />
           )}
-          <p className="field-hint">延续本机 CLI 的账号、项目规则与配置。</p>
+          <p className="field-hint">使用本机 CLI 的登录与项目配置。</p>
           {currentProvider && !currentProvider.available && (
             <div className="inline-warning">
               <AlertCircle size={15} />
@@ -1052,7 +1021,7 @@ export default function App() {
           if (value) setCliDrafts(settings.cliPaths)
         }}
         title="设置"
-        description="让你的工具按你的习惯工作"
+        description="配置 Agent、外观与快捷键。"
         className="settings-dialog"
       >
         <div className="settings-layout">
@@ -1185,7 +1154,7 @@ export default function App() {
             ) : settingsTab === 'general' ? (
               <>
                 <h3>外观</h3>
-                <p className="settings-description">选择让你专注的工作环境。</p>
+                <p className="settings-description">设置界面主题。</p>
                 <div className="theme-picker">
                   {(
                     [
@@ -1207,7 +1176,6 @@ export default function App() {
                 </div>
                 <div className="about-box">
                   <Brand small />
-                  <p>为本地 AI 编程而造的工作台。</p>
                   <div>
                     <span>版本</span>
                     <span>{version}</span>
@@ -1230,7 +1198,7 @@ export default function App() {
               </>
             ) : (
               <>
-                <h3>键盘优先，保持专注</h3>
+                <h3>快捷键</h3>
                 <p className="settings-description">macOS 使用 ⌘，Windows 使用 Ctrl。</p>
                 <div className="shortcut-list">
                   {[
@@ -1268,7 +1236,7 @@ export default function App() {
           if (!value) setRename(undefined)
         }}
         title="重命名会话"
-        description="为这段工作取一个清晰的名字"
+        description="输入新的会话名称。"
       >
         <form
           className="rename-form"
