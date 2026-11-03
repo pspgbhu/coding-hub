@@ -212,6 +212,12 @@ async function close() {
   await current?.close()
   current = undefined
 }
+async function waitForPaint(page) {
+  await page.evaluate(async () => {
+    await document.fonts.ready
+    await new Promise((painted) => requestAnimationFrame(() => requestAnimationFrame(painted)))
+  })
+}
 function preserved(value, expectedSchema) {
   assert.equal(value.schemaVersion, expectedSchema)
   assert.equal(value.integrity, 'ok')
@@ -249,6 +255,7 @@ try {
   const installedArchitecture = (await run('/usr/bin/file', ['-b', executable])).stdout.trim()
   console.log('Opening copied 0.1.0 with isolated v1 data and Chinese history.')
   const old = await launch('0.1.0')
+  await waitForPaint(old.page)
   await old.page.screenshot({ path: resolve('coverage/installation/old-0.1.0.png') })
   await close()
   preserved(await stored(), 1)
@@ -325,6 +332,7 @@ try {
       element.textContent.includes('UPGRADED_UNSAVED_BUFFER'),
     ),
   )
+  await waitForPaint(reopened.page)
   await reopened.page.screenshot({
     path: resolve('coverage/installation/upgraded-reopened-0.1.1.png'),
   })

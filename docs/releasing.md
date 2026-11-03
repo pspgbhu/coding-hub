@@ -32,7 +32,7 @@ node scripts/macos-install-smoke.mjs \
 
 脚本只读挂载两个本地 DMG，用 `ditto` 复制到私有临时 `Applications/Coding Hub.app`，实际启动旧版后在同一路径替换并启动新版。它验证隔离 v1 数据的迁移、中文历史、原生会话 ID、项目路径和设置保留，以及新版草稿与未保存编辑缓冲区的退出恢复；删除临时应用后，另行核对独立用户数据仍保留，最后才清理测试数据。所有 CLI 路径均指向私有不存在的文件，并过滤常见凭据环境变量；不使用真实 Agent 账号、用户应用目录或默认用户数据。JSON 记录实际版本、架构、DMG SHA256、断言与清理结果，截图写入 `coverage/installation/`。
 
-这项验证覆盖当前宿主的原生 macOS 复制、替换与删除应用流程，不覆盖 Finder 拖放操作、Gatekeeper、隔离属性、公证、生产签名、更新 feed 下载、Windows NSIS 或其他架构硬件。报告中的本机通过结果不能替代这些发行验收。
+每份报告覆盖其记录架构上的原生 macOS 复制、替换与删除应用流程，不覆盖 Finder 拖放操作、Gatekeeper、隔离属性、公证、生产签名、更新 feed 下载、Windows NSIS 或人工辅助技术验收。某个架构的通过结果不能替代另一架构的实际运行记录。
 
 ## 签名候选配置
 
@@ -68,9 +68,21 @@ macOS 两种架构共用 macOS 签名身份，Windows 使用自己的证书。�
 
 ## CI 产物与平台证据
 
-`.github/workflows/ci.yml` 配置 macOS x64、macOS arm64 和原生 Windows x64 的检查、内部打包、packaged E2E 与校验和。`.github/workflows/release.yml` 是手动触发的签名候选构建，输出带平台标识的 Actions artifacts。
+`.github/workflows/ci.yml` 配置 macOS x64、macOS arm64 和原生 Windows x64 的检查、内部打包、packaged E2E、原生安装升级验证与校验和。`.github/workflows/release.yml` 是手动触发的签名候选构建，输出带平台标识的 Actions artifacts。
 
-本次只有 macOS x64 本机验证证据。存在 CI YAML、构建队列、产物文件或某个其他架构的成功结果，都不能替代本平台的运行结果。Windows / arm64 的真实安装、升级、卸载与生产签名目前仍需目标系统记录。
+2026-11-03 的[CI run 41568623697](https://github.com/pspgbhu/coding-hub/actions/runs/41568623697)对应提交 `15bb76a`，两套原生 macOS runner 均已完成实际运行：
+
+| 目标架构    | 单元测试                        | 源码 E2E  | 安装包 E2E | 0.1.0 安装 → 0.1.1 升级 → 卸载保留数据 |
+| ----------- | ------------------------------- | --------- | ---------- | -------------------------------------- |
+| macOS x64   | 226 项通过                      | 17 项通过 | 17 项通过  | 13 项断言通过                          |
+| macOS arm64 | 226 项通过                      | 17 项通过 | 17 项通过  | 13 项断言通过                          |
+| Windows x64 | 11 项失败，209 项通过，6 项跳过 | 未进入    | 未进入     | 未进入                                 |
+
+Windows 的进程快照和 PTY 修复等待下一轮原生 CI；不能把修复代码或本机回归视为 Windows 已通过。两套 macOS 通过的是内部构建和隔离安装流程，仍不代表生产签名、公证、Gatekeeper、SmartScreen、更新 feed 或人工辅助技术验收完成。
+
+安装基线由 `scripts/build-install-baseline.mjs` 在 `runner.temp` 的独立 worktree 构建，固定源提交为 `9610d035cab6f85232972c8f9960d7282526af68`，不会替换当前源码。报告记录当前提交、实际架构、安装路径、新旧安装器摘要及清理结果；完成后移除旧版源码和临时安装 fixture。Windows 的 `scripts/windows-install-smoke.mjs` 仅允许显式启用的 GitHub-hosted CI，拒绝已存在的应用注册、快捷方式、默认数据和安装缓存；执行真实 NSIS 安装器与卸载器，不以删除目录代替卸载成功。
+
+每个平台的 `desktop-evidence-*` artifact 包含 `coverage/installation/` 中的基线与安装 JSON、截图，以及性能报告和 E2E 证据。上述两套 macOS 安装报告均已独立核对 13 项断言、新旧摘要、实际架构与清理结果，截图中的旧历史和新版草稿 / 编辑缓冲区均可见。产物文件、CI YAML 或其他架构的成功结果不能替代本平台的运行证据。
 
 生成校验和：
 

@@ -173,6 +173,8 @@ describe('process ownership ledger recovery is fail closed', () => {
     [nativeRecord({ started: '', members: [{ pid: 12346, started: 'invalid birth' }] })],
     [nativeRecord({ started: 'not a process birth identity' })],
     [nativeRecord({ members: [{ pid: 4567, started: '' }] })],
+    [nativeRecord({ uncertainMembers: [{ pid: -1, started: 'Tue Nov 3 10:00:00 2026' }] })],
+    [nativeRecord({ uncertainMembers: [{ pid: 12347, started: 'invalid birth' }] })],
     [nativeRecord(), nativeRecord({ id: 'invalid-tail', pid: -1 })],
   ])('does not accept malformed records or partially clean an invalid ledger: %j', async (raw) => {
     persistRunningTask()
@@ -231,6 +233,34 @@ describe('process ownership ledger recovery is fail closed', () => {
     expect(readTask().status).toBe('cancelled')
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual([])
   })
+
+  it.each([false, true])(
+    'preserves uncertain descendants across restart and retry without promoting them to verified members (leader birth missing: %s)',
+    async (missingLeaderBirth) => {
+      persistRunningTask()
+      const record = nativeRecord({
+        ...(missingLeaderBirth ? { started: '' } : {}),
+        uncertainMembers: [{ pid: 12347, started: 'Tue Nov 3 10:00:01 2026' }],
+      })
+      fs.writeFileSync(file, JSON.stringify([record]))
+      fixture.cleanup.mockRejectedValue(new Error('Cannot verify late process descendants'))
+      const service = open()
+      await expect(service.ready()).rejects.toThrow('Cannot verify late process descendants')
+      expect(fixture.cleanup).toHaveBeenCalledWith([record])
+      expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual([record])
+      expect(service.healthState.code).toBe('PROCESS_CLEANUP_FAILED')
+      expect(readTask().status).toBe('running')
+      await expect(service.handlers.retryStorage()).rejects.toThrow(
+        'Cannot verify late process descendants',
+      )
+      expect(fixture.cleanup.mock.calls.at(-1)?.[0]).toEqual([record])
+      expect(JSON.parse(fs.readFileSync(file, 'utf8'))[0].members).toEqual(record.members)
+      fixture.cleanup.mockResolvedValue(undefined)
+      await service.handlers.retryStorage()
+      expect(readTask().status).toBe('cancelled')
+      expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual([])
+    },
+  )
 
   it('allows a genuine first launch without a ledger or running task history', async () => {
     const service = open()

@@ -19,6 +19,8 @@ interface Terminal {
   paused: boolean
   tree: OwnedProcessTree
   exited: boolean
+  exitCode?: number
+  cleanup?: Promise<void>
   descriptor: TerminalDescriptor
   sequence: number
 }
@@ -43,6 +45,8 @@ export class TerminalService {
         : process.env.SHELL || '/bin/zsh'
     const terminal = nodePty.spawn(shell, process.platform === 'win32' ? [] : ['-l'], {
       name: 'xterm-256color',
+      // node-pty 1.1's system-ConPTY kill races its console-list helper. The bundled backend owns cleanup directly.
+      ...(process.platform === 'win32' ? { useConptyDll: true } : {}),
       ...dimensions,
       cwd,
       env: { ...getProcessEnvironment(), TERM: 'xterm-256color', COLORTERM: 'truecolor' },
@@ -66,7 +70,8 @@ export class TerminalService {
         buffer: '',
       },
     }
-    entry.tree = ownProcessTree(terminal.pid, () => !entry.exited)
+    // forkpty creates a dedicated POSIX session/process group; its surviving group keeps that identity reserved.
+    entry.tree = ownProcessTree(terminal.pid, () => !entry.exited, process.platform !== 'win32')
     this.terminals.set(id, entry)
     terminal.onData((data) => {
       if (!this.terminals.has(id)) return
@@ -81,10 +86,11 @@ export class TerminalService {
     })
     terminal.onExit(({ exitCode }) => {
       entry.exited = true
-      entry.tree.release()
-      if (!this.terminals.delete(id)) return
-      this.remember({ ...entry.descriptor, sequence: ++entry.sequence, exitCode })
-      this.emit({ id, exitCode, sequence: entry.sequence })
+      entry.exitCode = exitCode
+      // Shell exit may arrive before late-descendant verification. Keep the workspace occupied until confirmed.
+      void this.confirmExit(entry).catch(() => {
+        /* The retained terminal reports a retryable cleanup diagnostic. */
+      })
     })
     return id
   }
@@ -161,15 +167,41 @@ export class TerminalService {
     }
   }
 
+  private confirmExit(entry: Terminal): Promise<void> {
+    if (entry.cleanup) return entry.cleanup
+    const id = entry.descriptor.id
+    const pending = (async () => {
+      try {
+        await entry.tree.terminate()
+        if (!entry.exited) entry.pty.kill()
+        if (this.terminals.get(id) !== entry) return
+        this.terminals.delete(id)
+        const exitCode = entry.exitCode ?? 130
+        this.remember({ ...entry.descriptor, sequence: ++entry.sequence, exitCode })
+        this.emit({ id, exitCode, sequence: entry.sequence })
+      } catch (error) {
+        if (this.terminals.get(id) === entry) {
+          const data = '\r\n[终端子进程清理尚未确认，工作区保持占用。请重试“终止当前终端”。]\r\n'
+          entry.descriptor.sequence = ++entry.sequence
+          entry.descriptor.buffer = ((entry.descriptor.buffer || '') + data).slice(
+            -REPLAY_CHARACTERS,
+          )
+          this.emit({ id, data, sequence: entry.sequence })
+        }
+        throw error
+      }
+    })()
+    const cleanup = pending.finally(() => {
+      if (entry.cleanup === cleanup) entry.cleanup = undefined
+    })
+    entry.cleanup = cleanup
+    return cleanup
+  }
+
   async close(id: string): Promise<void> {
     const entry = this.terminals.get(id)
     if (!entry) return
-    await entry.tree.terminate()
-    if (!entry.exited) entry.pty.kill()
-    if (this.terminals.delete(id)) {
-      this.remember({ ...entry.descriptor, sequence: ++entry.sequence, exitCode: 130 })
-      this.emit({ id, exitCode: 130, sequence: entry.sequence })
-    }
+    await this.confirmExit(entry)
   }
 
   async closeAll(): Promise<void> {

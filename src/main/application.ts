@@ -233,6 +233,7 @@ export class ApplicationServices {
           started: z.union([birth, z.literal('')]),
           isolatedGroup: z.boolean(),
           members: z.array(member).max(50000).optional(),
+          uncertainMembers: z.array(member).max(50000).optional(),
         })
         .refine(
           (entry) =>
@@ -271,6 +272,19 @@ export class ApplicationServices {
                     ]),
                   ).values(),
                 ],
+                ...((entry.uncertainMembers?.length ?? 0) ||
+                (existing.uncertainMembers?.length ?? 0)
+                  ? {
+                      uncertainMembers: [
+                        ...new Map(
+                          [
+                            ...(entry.uncertainMembers ?? []),
+                            ...(existing.uncertainMembers ?? []),
+                          ].map((member) => [`${member.pid}:${member.started}`, member]),
+                        ).values(),
+                      ],
+                    }
+                  : {}),
               }
             : entry,
         )

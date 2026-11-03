@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, readdirSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const target =
@@ -13,6 +13,25 @@ const executable = resolve(target)
 if (!existsSync(executable))
   throw new Error(`No native packaged executable found at ${target}. Package this target first.`)
 console.log(`Packaged application: ${executable}`)
+if (process.platform === 'win32') {
+  const unpacked = join(dirname(executable), 'resources', 'app.asar.unpacked')
+  const bindings = readdirSync(unpacked, { recursive: true, withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        entry.name === 'conpty.node' &&
+        entry.parentPath.split(/[\\/]/).includes('node-pty'),
+    )
+    .map((entry) => join(entry.parentPath, entry.name))
+  const complete = bindings.find((binding) =>
+    ['conpty.dll', 'OpenConsole.exe'].every((file) =>
+      existsSync(join(dirname(binding), 'conpty', file)),
+    ),
+  )
+  if (!complete)
+    throw new Error('The packaged Windows terminal is missing its vendored ConPTY DLLs.')
+  console.log(`Vendored ConPTY: ${join(dirname(complete), 'conpty')}`)
+}
 const result = spawnSync(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['test:e2e'], {
   stdio: 'inherit',
   shell: process.platform === 'win32',
