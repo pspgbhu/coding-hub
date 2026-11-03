@@ -17,6 +17,7 @@ import { arch, cpus, release } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { _electron as electron } from '@playwright/test'
+import { normalizeRegistryRows } from './windows-install-registry.cjs'
 
 if (process.platform !== 'win32' || process.arch !== 'x64')
   throw new Error('This installation smoke requires native Windows x64.')
@@ -232,8 +233,11 @@ async function ps(script) {
   return JSON.parse(result.stdout.trim())
 }
 async function registry() {
-  return ps(
-    `$result=@(); foreach($hive in @('CurrentUser','LocalMachine')) { foreach($view in @('Registry64','Registry32')) { $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::$hive,[Microsoft.Win32.RegistryView]::$view); try { foreach($path in @('Software\\${guid}','Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${guid}')) { $key=$base.OpenSubKey($path); try { $result += [pscustomobject]@{hive=$hive;view=$view;key=$path;exists=($null -ne $key);location=$(if($key){$key.GetValue('InstallLocation')});version=$(if($key){$key.GetValue('DisplayVersion')})} } finally { if($key){$key.Close()} } } } finally { $base.Close() } } }; ConvertTo-Json -InputObject @($result) -Compress`,
+  return normalizeRegistryRows(
+    await ps(
+      `$result=@(); foreach($hive in @('CurrentUser','LocalMachine')) { foreach($view in @('Registry64','Registry32')) { $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::$hive,[Microsoft.Win32.RegistryView]::$view); try { foreach($path in @('Software\\${guid}','Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${guid}')) { $key=$base.OpenSubKey($path); try { $location=$null; $version=$null; if($null -ne $key) { $location=$key.GetValue('InstallLocation'); $version=$key.GetValue('DisplayVersion') }; $result += [pscustomobject]@{hive=$hive;view=$view;key=$path;exists=($null -ne $key);location=$location;version=$version} } finally { if($key){$key.Close()} } } } finally { $base.Close() } } }; ConvertTo-Json -InputObject @($result) -Compress`,
+    ),
+    guid,
   )
 }
 async function appProcesses() {
