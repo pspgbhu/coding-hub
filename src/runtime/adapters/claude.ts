@@ -1,6 +1,7 @@
 import {
   query,
   type Query,
+  type EffortLevel,
   type SDKUserMessage,
   type SpawnOptions,
   type SpawnedProcess,
@@ -245,6 +246,9 @@ export class ClaudeAdapter {
           cwd: turn.context.cwd,
           resume: turn.context.session.nativeId,
           model: turn.context.session.model || undefined,
+          effort: (turn.context.session.model
+            ? turn.context.session.reasoningOption
+            : undefined) as EffortLevel | undefined,
           settingSources: ['user', 'project', 'local'],
           systemPrompt: { type: 'preset', preset: 'claude_code' },
           includePartialMessages: true,
@@ -417,7 +421,19 @@ export class ClaudeAdapter {
         },
       })
       const models = await instance.supportedModels()
-      return models.map((model) => ({ id: model.value, name: model.displayName }))
+      return models.map((model) => ({
+        id: model.value,
+        name: model.displayName,
+        ...(model.description ? { description: model.description } : {}),
+        ...(model.supportsEffort !== false && model.supportedEffortLevels?.length
+          ? {
+              reasoning: {
+                kind: 'effort' as const,
+                options: model.supportedEffortLevels.map((value) => ({ value, label: value })),
+              },
+            }
+          : {}),
+      }))
     } finally {
       clearTimeout(timer)
       queue.end()

@@ -6,6 +6,7 @@ import type {
   AgentEvent,
   BackupInfo,
   ComposerDraft,
+  NewSessionDraft,
   EditorState,
   Project,
   ProviderId,
@@ -249,16 +250,21 @@ export class Store {
     })
   }
   session(id: string): Session {
+    const session = this.findSession(id)
+    if (!session) throw new Error('会话不存在。')
+    return session
+  }
+  findSession(id: string): Session | undefined {
     const row = this.db.prepare('SELECT data FROM sessions WHERE id = ?').get(id) as
       { data: string } | undefined
-    if (!row) throw new Error('会话不存在。')
-    return JSON.parse(row.data)
+    return row ? JSON.parse(row.data) : undefined
   }
   createSession(
     projectId: string,
     provider: ProviderId,
     model?: string,
     workspaceId = projectId,
+    options: { id?: string; reasoningOption?: string } = {},
   ): Session {
     const project = this.project(projectId)
     const workspace = this.workspace(workspaceId)
@@ -266,11 +272,12 @@ export class Store {
       throw new Error('会话需要此项目中可用的工作区。')
     const now = Date.now()
     const session: Session = {
-      id: randomUUID(),
+      id: options.id ?? randomUUID(),
       projectId,
       workspaceId,
       provider,
       model,
+      reasoningOption: options.reasoningOption,
       title: '新会话',
       status: 'idle',
       archived: false,
@@ -381,6 +388,76 @@ export class Store {
       )
       .run(sessionId, JSON.stringify(draft))
     return draft
+  }
+  getNewSessionDraft(projectId: string): NewSessionDraft {
+    this.project(projectId)
+    const row = this.db
+      .prepare('SELECT data FROM settings WHERE key = ?')
+      .get(`new-session-draft:${projectId}`) as { data: string } | undefined
+    if (row) return JSON.parse(row.data)
+    const defaults = this.settings().newSessionDefaults?.[projectId]
+    return {
+      id: randomUUID(),
+      text: '',
+      context: [],
+      updatedAt: 0,
+      provider: defaults?.provider ?? 'codex',
+      model: defaults?.model,
+      reasoningOption: defaults?.reasoningOption,
+      workspace: { kind: 'shared' },
+    }
+  }
+  saveNewSessionDraft(projectId: string, draft: NewSessionDraft): NewSessionDraft {
+    const project = this.project(projectId)
+    if (project.removedAt) throw new Error('请先恢复项目，再保存新会话草稿。')
+    const consumed = this.findSession(draft.id)
+    if (consumed) {
+      if (consumed.projectId !== projectId)
+        throw new Error('[STALE_NEW_SESSION_DRAFT] 此草稿不属于当前项目，旧保存已忽略。')
+      return draft
+    }
+    const row = this.db
+      .prepare('SELECT data FROM settings WHERE key = ?')
+      .get(`new-session-draft:${projectId}`) as { data: string } | undefined
+    if (row) {
+      const previous: NewSessionDraft = JSON.parse(row.data)
+      if (previous.id !== draft.id)
+        throw new Error('[STALE_NEW_SESSION_DRAFT] 新会话草稿已更换，请重新打开。')
+      if (previous.updatedAt > draft.updatedAt) return previous
+    }
+    this.db
+      .prepare(
+        'INSERT INTO settings(key,data) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data',
+      )
+      .run(`new-session-draft:${projectId}`, JSON.stringify(draft))
+    return draft
+  }
+  createSessionFromDraft(projectId: string, draftId: string, workspaceId: string): Session {
+    return this.db.transaction(() => {
+      const existing = this.findSession(draftId)
+      if (existing) {
+        if (existing.projectId !== projectId) throw new Error('会话不属于此项目。')
+        return existing
+      }
+      const row = this.db
+        .prepare('SELECT data FROM settings WHERE key = ?')
+        .get(`new-session-draft:${projectId}`) as { data: string } | undefined
+      const draft: NewSessionDraft | undefined = row ? JSON.parse(row.data) : undefined
+      if (!draft || draft.id !== draftId)
+        throw new Error('[STALE_NEW_SESSION_DRAFT] 新会话草稿已更换，请重新打开。')
+      const session = this.createSession(projectId, draft.provider, draft.model, workspaceId, {
+        id: draft.id,
+        reasoningOption: draft.reasoningOption,
+      })
+      this.saveDraft(session.id, {
+        text: draft.text,
+        context: draft.context,
+        updatedAt: draft.updatedAt,
+      })
+      this.db.prepare('DELETE FROM settings WHERE key = ?').run(`new-session-draft:${projectId}`)
+      this.saveSettings({ ...this.settings(), lastProjectId: projectId, lastSessionId: session.id })
+      return session
+    })()
   }
   getEditorState(workspaceId: string): EditorState {
     this.workspace(workspaceId)

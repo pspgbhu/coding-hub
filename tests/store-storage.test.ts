@@ -200,6 +200,116 @@ describe('versioned local storage', () => {
     expect(reopened.workspace(project.id).cwd).toBe(project.path)
   })
 
+  it('persists independent project drafts and ignores older saves without changing app settings', () => {
+    const { store, project, directory, path } = setup()
+    const other = store.addProject(join(directory, 'other-project'), '另一个项目')
+    store.saveSettings({
+      theme: 'dark',
+      cliPaths: {},
+      newSessionDefaults: {
+        [project.id]: { provider: 'claude', model: 'sonnet', reasoningOption: 'high' },
+      },
+    })
+    const draft = {
+      ...store.getNewSessionDraft(project.id),
+      text: 'unsent task',
+      context: [
+        {
+          id: 'image',
+          kind: 'image' as const,
+          name: 'fixture.png',
+          dataUrl: 'data:image/png;base64,AAAA',
+        },
+      ],
+      updatedAt: 20,
+    }
+    expect(draft).toMatchObject({
+      provider: 'claude',
+      model: 'sonnet',
+      reasoningOption: 'high',
+      workspace: { kind: 'shared' },
+    })
+    store.saveNewSessionDraft(project.id, draft)
+    store.saveNewSessionDraft(other.id, {
+      ...store.getNewSessionDraft(other.id),
+      text: 'other task',
+      updatedAt: 15,
+    })
+    expect(
+      store.saveNewSessionDraft(project.id, { ...draft, text: 'stale', updatedAt: 10 }),
+    ).toEqual(draft)
+    expect(store.settings().theme).toBe('dark')
+    close(store)
+    const reopened = open(path)
+    expect(reopened.getNewSessionDraft(project.id)).toEqual(draft)
+    expect(reopened.getNewSessionDraft(other.id).text).toBe('other task')
+  })
+
+  it('atomically moves a pending draft into one stable session and ignores delayed consumed saves', () => {
+    const { store, project, directory } = setup()
+    const draft = {
+      ...store.getNewSessionDraft(project.id),
+      text: 'first task',
+      provider: 'codex' as const,
+      model: 'model',
+      reasoningOption: 'high',
+      updatedAt: 20,
+    }
+    store.saveNewSessionDraft(project.id, draft)
+    const created = store.createSessionFromDraft(project.id, draft.id, project.id)
+    expect(created).toMatchObject({
+      id: draft.id,
+      projectId: project.id,
+      workspaceId: project.id,
+      model: 'model',
+      reasoningOption: 'high',
+    })
+    expect(store.getDraft(created.id)).toEqual({ text: draft.text, context: [], updatedAt: 20 })
+    expect(store.settings().lastSessionId).toBe(created.id)
+    expect(store.getNewSessionDraft(project.id).id).not.toBe(draft.id)
+    expect(store.createSessionFromDraft(project.id, draft.id, project.id)).toEqual(created)
+    const next = {
+      ...store.getNewSessionDraft(project.id),
+      text: 'next pending task',
+      updatedAt: 30,
+    }
+    store.saveNewSessionDraft(project.id, next)
+    expect(() => store.saveNewSessionDraft(project.id, { ...draft, updatedAt: 100 })).not.toThrow()
+    expect(store.getNewSessionDraft(project.id)).toEqual(next)
+    const other = store.addProject(join(directory, 'other-project'), '另一个项目')
+    expect(() => store.saveNewSessionDraft(other.id, draft)).toThrow('STALE_NEW_SESSION_DRAFT')
+    expect(store.sessions().filter((item) => item.id === draft.id)).toHaveLength(1)
+  })
+
+  it('rolls back the entire pending draft handoff when any write fails', () => {
+    const { store, project } = setup()
+    const draft = { ...store.getNewSessionDraft(project.id), text: 'preserve task', updatedAt: 1 }
+    store.saveNewSessionDraft(project.id, draft)
+    vi.spyOn(store, 'saveSettings').mockImplementationOnce(() => {
+      throw new Error('SQLITE_FULL')
+    })
+    expect(() => store.createSessionFromDraft(project.id, draft.id, project.id)).toThrow(
+      'SQLITE_FULL',
+    )
+    expect(store.findSession(draft.id)).toBeUndefined()
+    expect(store.getNewSessionDraft(project.id)).toEqual(draft)
+    expect(
+      store.db.prepare('SELECT 1 FROM composer_drafts WHERE session_id = ?').get(draft.id),
+    ).toBeUndefined()
+    expect(store.settings().lastSessionId).toBeUndefined()
+  })
+
+  it('includes pending drafts in backup restore without a schema change', () => {
+    const { store, project } = setup()
+    const draft = { ...store.getNewSessionDraft(project.id), text: 'backup task', updatedAt: 1 }
+    store.saveNewSessionDraft(project.id, draft)
+    const backup = store.createBackup()
+    store.saveNewSessionDraft(project.id, { ...draft, text: 'later task', updatedAt: 2 })
+    store.restoreBackup(backup.id)
+    expect(store.getNewSessionDraft(project.id)).toEqual(draft)
+    expect(store.verifyBackup(backup.id).schemaVersion).toBe(SCHEMA_VERSION)
+  })
+
   it('keeps project removal and session trash reversible without changing native sessions', () => {
     const { store, project, session } = setup()
     emit(store, session.id, 'retained history')

@@ -28,7 +28,7 @@ See [verification](verification.md) for commands, measurements and boundaries.
 ## B — Isolated workspaces
 
 - [x] Repository/Workspace identities own files, native sessions, drafts, terminals and Git.
-- [x] New Git sessions default to owned worktrees from committed HEAD; legacy native cwd is immutable.
+- [x] New sessions default to the local shared directory; owned worktrees from committed HEAD remain opt-in, and legacy native cwd is immutable.
 - [x] Shared/non-Git workspaces allow one active Agent turn; independent worktrees can run concurrently.
 - [x] List/compare/apply/clean worktrees with explicit conflicts and protections for edits, tasks and terminals.
 - [x] No implicit credential copying, dependency installation or project-script execution.

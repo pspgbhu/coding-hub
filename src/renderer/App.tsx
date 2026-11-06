@@ -3,7 +3,6 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { createPortal } from 'react-dom'
 import {
   Archive,
-  ArrowRight,
   Check,
   Code2,
   Command,
@@ -11,7 +10,6 @@ import {
   Folder,
   FolderOpen,
   LoaderCircle,
-  MessageSquare,
   Monitor,
   Moon,
   MoreHorizontal,
@@ -47,9 +45,11 @@ import type {
   SessionSearchResult,
 } from '../shared/types'
 import { ACTIVE_STATUSES, PROVIDERS } from '../shared/types'
-import { api, appendEvent, errorText, shortPath } from './lib/api'
+import { api, appendEvent, errorText } from './lib/api'
 import { flushBeforeClose } from './lib/close-flush'
 import Chat from './components/Chat'
+import NewConversation from './components/NewConversation'
+import { ComposerSelectors } from './components/ComposerSelectors'
 import LayoutHandles from './components/LayoutHandles'
 import WindowedSessionList from './components/WindowedSessionList'
 import {
@@ -139,74 +139,7 @@ function Modal({
     </Dialog.Root>
   )
 }
-function EmptyState({
-  project,
-  providers,
-  checking,
-  addProject,
-  createSession,
-  openSettings,
-}: {
-  project?: Project
-  providers: ProviderInfo[]
-  checking: boolean
-  addProject: () => void
-  createSession: () => void
-  openSettings: () => void
-}) {
-  return (
-    <div className="home">
-      <div className="home-content">
-        <h1>{project ? '项目会话' : '打开项目'}</h1>
-        <p className="home-description">
-          {project ? '在当前项目中创建会话。' : '选择本地目录，然后创建会话。'}
-        </p>
-        <button
-          className="button primary home-action"
-          onClick={project ? createSession : addProject}
-        >
-          {project ? <Plus size={17} /> : <FolderOpen size={17} />}
-          {project ? '新建会话' : '打开项目'}
-          <ArrowRight size={16} />
-        </button>
-        {project && (
-          <div className="home-project">
-            <Folder size={13} />
-            <strong>{project.name}</strong>
-            <span>{shortPath(project.path)}</span>
-          </div>
-        )}
-        <div className="home-agents">
-          {providerIds.map((id) => {
-            const info = providers.find((p) => p.id === id)
-            return (
-              <button className="agent-readiness" key={id} onClick={openSettings}>
-                <span className="provider-monogram" style={{ color: PROVIDERS[id].color }}>
-                  {id === 'claude' ? '✳' : id === 'codex' ? '◇' : '⌘'}
-                </span>
-                <div>
-                  <strong>{PROVIDERS[id].name}</strong>
-                  <small>
-                    {checking
-                      ? '正在检测'
-                      : info?.available
-                        ? `${info.version || 'CLI 可用'}${info.readiness?.authentication !== 'ready' ? ' · 登录尚未验证' : ''}`
-                        : '需要配置'}
-                  </small>
-                </div>
-                {checking ? (
-                  <LoaderCircle size={11} className="spin" />
-                ) : (
-                  <span className={`status-dot ${info?.available ? '' : 'off'}`} />
-                )}
-              </button>
-            )
-          })}
-        </div>
-      </div>
-    </div>
-  )
-}
+
 function App() {
   const [booting, setBooting] = useState(true)
   const [bootError, setBootError] = useState('')
@@ -239,18 +172,11 @@ function App() {
   const [terminalProjects, setTerminalProjects] = useState<string[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState('agents')
-  const [newOpen, setNewOpen] = useState(false)
-  const [selectedProvider, setSelectedProvider] = useState<ProviderId>('codex')
-  const [model, setModel] = useState('')
-  const modelEdited = useRef(false)
-  const modelInitialized = useRef(false)
-  const [newPending, setNewPending] = useState(false)
-  const [isolated, setIsolated] = useState(true)
-  const [newWorkspaceId, setNewWorkspaceId] = useState('')
-  const [workspaceChecking, setWorkspaceChecking] = useState(false)
-  const [canIsolate, setCanIsolate] = useState(false)
-  const [workspaceHint, setWorkspaceHint] = useState('')
-  const workspaceCheck = useRef(0)
+  const [newFocus, setNewFocus] = useState(0)
+  const [selectionPending, setSelectionPending] = useState(false)
+  const selectionLock = useRef(false)
+  const projectRef = useRef<string | undefined>(undefined)
+  projectRef.current = projectId
   const [addingProject, setAddingProject] = useState(false)
   const [search, setSearch] = useState('')
   const [searchIds, setSearchIds] = useState<Set<string>>(new Set())
@@ -280,6 +206,7 @@ function App() {
   const [rename, setRename] = useState<{ id: string; title: string }>()
   const [toast, setToast] = useState<{ message: string; error: boolean }>()
   const [context, setContext] = useState<ContextItem>()
+  const carryNewContext = useRef(false)
   const [systemDark, setSystemDark] = useState(
     window.matchMedia('(prefers-color-scheme: dark)').matches,
   )
@@ -287,7 +214,6 @@ function App() {
   const [savingSettings, setSavingSettings] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
   const providerProbe = useRef(0)
-  const pendingContext = useRef<ContextItem | undefined>(undefined)
   const activeRef = useRef(sessionId)
   const eventIds = useRef(new Set<string>())
   const incoming = useRef<{ id: string; buffer: AgentEvent[] } | null>(null)
@@ -385,6 +311,7 @@ function App() {
       if (!api) return
       const probe = ++providerProbe.current
       setChecking(true)
+      setProviders([])
       try {
         const detected = await api.providers(id)
         if (probe === providerProbe.current) setProviders(detected)
@@ -500,8 +427,8 @@ function App() {
     const request = ++historyRequest.current
     paging.current = false
     setLoadingMore(false)
-    setContext(pendingContext.current)
-    pendingContext.current = undefined
+    if (!carryNewContext.current) setContext(undefined)
+    carryNewContext.current = false
     eventIds.current.clear()
     setEvents([])
     setHasMore(false)
@@ -628,7 +555,14 @@ function App() {
     setTerminal((value) => !value)
   }
   async function chooseProject(id: string) {
+    try {
+      await flushBeforeClose()
+    } catch (error) {
+      reportError(error)
+      return
+    }
     setProjectId(id)
+    setContext(undefined)
     setSessionId(undefined)
     setMenuId(undefined)
     setTerminal(false)
@@ -698,69 +632,44 @@ function App() {
     }
   }
   function openNew() {
-    if (!project) {
-      void addProject()
-      return
-    }
-    const available =
-      providers.find((info) => info.available && info.id === selectedProvider) ||
-      providers.find((info) => info.available)
-    const id = available?.id || selectedProvider
-    const firstModel = providers.find((info) => info.id === id)?.models[0]?.id
-    modelEdited.current = false
-    modelInitialized.current = !!firstModel
-    setModel(firstModel || '')
-    setSelectedProvider(id)
-    setNewOpen(true)
-    setIsolated(false)
-    setCanIsolate(false)
-    setWorkspaceHint(project.trusted ? '正在检查项目仓库…' : '请先信任项目。')
-    setNewWorkspaceId('')
-    const token = ++workspaceCheck.current
-    if (!project.trusted) {
-      setWorkspaceChecking(false)
-      return
-    }
-    setWorkspaceChecking(true)
-    void api.inspectWorkspace(project.id).then(
-      (identity) => {
-        if (token !== workspaceCheck.current) return
-        setCanIsolate(identity.hasHead)
-        setIsolated(identity.hasHead)
-        setWorkspaceHint(
-          identity.hasHead
-            ? '独立工作区保留各会话修改；已有会话始终继续使用原目录。'
-            : '项目尚无 Git 提交，已选择共享工作区；创建首个提交后可使用独立工作区。',
-        )
-        setWorkspaceChecking(false)
-      },
-      () => {
-        if (token !== workspaceCheck.current) return
-        setWorkspaceHint('未检测到可用的 Git 提交，已选择共享工作区。')
-        setWorkspaceChecking(false)
-      },
-    )
+    setSessionId(undefined)
+    setNewFocus((value) => value + 1)
+    setMenuId(undefined)
+    setSearch('')
+    setArchived(false)
+    setTrash(false)
+    void saveSettings({ lastSessionId: undefined }).catch(reportError)
   }
-  async function createSession() {
-    if (!project || workspaceChecking || (isolated && !canIsolate)) return
-    setNewPending(true)
+  function rememberSelection(selection: {
+    provider: ProviderId
+    model?: string
+    reasoningOption?: string
+  }) {
+    if (!projectId) return
+    void saveSettings({
+      newSessionDefaults: { ...settingsRef.current.newSessionDefaults, [projectId]: selection },
+    }).catch(reportError)
+  }
+  async function changeSessionSelection(selection: {
+    provider: ProviderId
+    model?: string
+    reasoningOption?: string
+  }) {
+    if (!session || selectionLock.current) return
+    selectionLock.current = true
+    setSelectionPending(true)
     try {
-      const created = await api.createSession({
-        projectId: project.id,
-        provider: selectedProvider,
-        model: model.trim() || undefined,
-        isolated: !newWorkspaceId && isolated,
-        workspaceId: newWorkspaceId || undefined,
+      const updated = await api.updateSession(session.id, {
+        model: selection.model,
+        reasoningOption: selection.reasoningOption ?? null,
       })
-      setSessions((previous) => [created, ...previous.filter((item) => item.id !== created.id)])
-      chooseSession(created)
-      setNewOpen(false)
-      setArchived(false)
-      setSearch('')
+      setSessions((previous) => previous.map((item) => (item.id === updated.id ? updated : item)))
+      rememberSelection(selection)
     } catch (error) {
       reportError(error)
     } finally {
-      setNewPending(false)
+      selectionLock.current = false
+      setSelectionPending(false)
     }
   }
   async function updateSession(id: string, patch: Parameters<typeof api.updateSession>[1]) {
@@ -863,15 +772,6 @@ function App() {
     .sort(
       (a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt,
     )
-  useEffect(() => {
-    if (!newOpen || modelEdited.current || modelInitialized.current) return
-    const firstModel = providers.find((info) => info.id === selectedProvider)?.models[0]?.id
-    if (firstModel) {
-      setModel(firstModel)
-      modelInitialized.current = true
-    }
-  }, [newOpen, selectedProvider, providers])
-  const currentProvider = providers.find((item) => item.id === selectedProvider)
   if (booting || bootError)
     return (
       <div className="startup">
@@ -989,7 +889,7 @@ function App() {
           <aside className="sidebar">
             <div className="sidebar-top">
               <Brand />
-              <button className="new-session-button" onClick={openNew}>
+              <button className="new-session-button" aria-label="新建会话" onClick={openNew}>
                 <Plus size={16} />
                 <span>新建会话</span>
                 <kbd>{platform === 'darwin' ? '⌘' : 'Ctrl'} N</kbd>
@@ -1099,6 +999,7 @@ function App() {
                     {(item) => (
                       <div
                         key={item.id}
+                        data-session-id={item.id}
                         className={`session-row ${sessionId === item.id ? 'active' : ''}`}
                         style={{ height: search ? 50 : 34 }}
                       >
@@ -1395,13 +1296,31 @@ function App() {
                     </div>
                   </div>
                   <Chat
+                    key={session.id}
                     session={session}
+                    composerControls={(busy) => (
+                      <ComposerSelectors
+                        providers={providers}
+                        provider={session.provider}
+                        model={session.model}
+                        reasoningOption={session.reasoningOption}
+                        fixedProvider
+                        disabled={
+                          busy ||
+                          checking ||
+                          selectionPending ||
+                          ACTIVE_STATUSES.includes(session.status)
+                        }
+                        onChange={(selection) => void changeSessionSelection(selection)}
+                        onConfigure={() => setSettingsOpen(true)}
+                      />
+                    )}
                     events={events}
                     loading={loadingSession}
                     provider={providers.find((item) => item.id === session.provider)}
-                    onSend={(text) => {
+                    onSend={(text, draft) => {
                       if (hasNewer || focusEventId) latestHistory()
-                      return api.sendMessage(session.id, text)
+                      return api.sendMessage(session.id, text, { draftUpdatedAt: draft.updatedAt })
                     }}
                     onStop={() => void api.interrupt(session.id).catch(reportError)}
                     onError={reportError}
@@ -1422,13 +1341,52 @@ function App() {
                   />
                 </>
               ) : (
-                <EmptyState
+                <NewConversation
                   project={project}
+                  projects={projects}
                   providers={providers}
                   checking={checking}
-                  addProject={() => void addProject()}
-                  createSession={openNew}
-                  openSettings={() => setSettingsOpen(true)}
+                  workspaces={workspaces}
+                  settings={settings}
+                  disabled={health.storage === 'error'}
+                  focusRequest={newFocus}
+                  context={context}
+                  clearContext={() => setContext(undefined)}
+                  onChooseProject={(id) => void chooseProject(id).catch(reportError)}
+                  onAddProject={() => void addProject()}
+                  onConfigure={() => setSettingsOpen(true)}
+                  onRemember={rememberSelection}
+                  beforeCreate={async () => {
+                    await settingsQueue.current
+                  }}
+                  onPrepared={(created) => {
+                    if (projectRef.current !== created.projectId || activeRef.current) {
+                      void saveSettings({
+                        lastProjectId: projectRef.current,
+                        lastSessionId: activeRef.current,
+                      }).catch(reportError)
+                      return
+                    }
+                    const next = {
+                      ...settingsRef.current,
+                      lastProjectId: created.projectId,
+                      lastSessionId: created.id,
+                    }
+                    settingsRef.current = next
+                    setSettings(next)
+                  }}
+                  onCreated={(created) => {
+                    setSessions((previous) => [
+                      previous.find((item) => item.id === created.id) ?? created,
+                      ...previous.filter((item) => item.id !== created.id),
+                    ])
+                    if (projectRef.current === created.projectId && !activeRef.current) {
+                      carryNewContext.current = true
+                      chooseSession(created)
+                      setArchived(false)
+                    }
+                  }}
+                  onError={reportError}
                 />
               )}
             </div>
@@ -1475,12 +1433,10 @@ function App() {
                         endLine,
                       }
                       if (!session) {
-                        pendingContext.current = reference
                         openNew()
-                      } else {
-                        setContext(reference)
-                        notify('已引用到对话')
                       }
+                      setContext(reference)
+                      notify('已引用到对话')
                     }}
                   />
                 </Suspense>
@@ -1530,141 +1486,6 @@ function App() {
             ))}
         </main>
       </div>
-      <Modal
-        open={newOpen}
-        onOpenChange={(value) => {
-          if (!value) workspaceCheck.current++
-          setNewOpen(value)
-        }}
-        title="新建会话"
-        description={`为 ${project?.name || '当前项目'} 创建会话。`}
-      >
-        <div className="new-session-body">
-          <label className="field-label">选择 coding agent</label>
-          <div className="provider-picker">
-            {providerIds.map((id) => {
-              const info = providers.find((item) => item.id === id)
-              return (
-                <button
-                  key={id}
-                  className={selectedProvider === id ? 'selected' : ''}
-                  onClick={() => {
-                    const firstModel = info?.models[0]?.id
-                    modelEdited.current = false
-                    modelInitialized.current = !!firstModel
-                    setSelectedProvider(id)
-                    setModel(firstModel || '')
-                  }}
-                >
-                  <span className="provider-monogram" style={{ color: PROVIDERS[id].color }}>
-                    {id === 'claude' ? '✳' : id === 'codex' ? '◇' : '⌘'}
-                  </span>
-                  <strong>{PROVIDERS[id].name}</strong>
-                  <span className={`provider-ready ${info?.available ? '' : 'unavailable'}`}>
-                    <span className={`status-dot ${info?.available ? '' : 'off'}`} />
-                    {info?.available ? 'CLI 可用' : '未检测到'}
-                  </span>
-                  {selectedProvider === id && <Check size={14} className="provider-check" />}
-                </button>
-              )
-            })}
-          </div>
-          <label className="field-label" htmlFor="session-model">
-            模型 <span>可选</span>
-          </label>
-          {currentProvider?.models.length ? (
-            <select
-              id="session-model"
-              className="input"
-              value={model}
-              onChange={(event) => {
-                modelEdited.current = true
-                setModel(event.target.value)
-              }}
-            >
-              <option value="">使用 CLI 配置</option>
-              {model && !currentProvider.models.some((item) => item.id === model) && (
-                <option value={model}>{model}</option>
-              )}
-              {currentProvider.models.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name} · {item.id}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              id="session-model"
-              className="input"
-              value={model}
-              onChange={(event) => {
-                modelEdited.current = true
-                setModel(event.target.value)
-              }}
-              placeholder="使用 CLI 配置"
-            />
-          )}
-          <p className="field-hint">使用本机 CLI 的登录与项目配置。</p>
-          <label className="field-label" htmlFor="session-workspace">
-            工作区
-          </label>
-          <select
-            id="session-workspace"
-            className="input"
-            disabled={workspaceChecking}
-            value={newWorkspaceId || (isolated ? 'isolated' : 'shared')}
-            onChange={(event) => {
-              const value = event.target.value
-              setIsolated(value === 'isolated')
-              setNewWorkspaceId(value === 'isolated' || value === 'shared' ? '' : value)
-            }}
-          >
-            <option value="isolated" disabled={!canIsolate}>
-              新建独立工作区（推荐）
-            </option>
-            <option value="shared">项目共享工作区</option>
-            {workspaces
-              .filter((item) => item.projectId === projectId && item.kind === 'worktree')
-              .map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name} · {item.branch || item.cwd}
-                </option>
-              ))}
-          </select>
-          <p className="field-hint" role="status">
-            {workspaceHint}
-          </p>
-          {currentProvider && !currentProvider.available && (
-            <div className="inline-warning">
-              <AlertCircle size={15} />
-              <span>{currentProvider.error || '请先安装或配置此 Agent CLI。'}</span>
-              <button
-                onClick={() => {
-                  setNewOpen(false)
-                  setSettingsOpen(true)
-                }}
-              >
-                前往设置
-              </button>
-            </div>
-          )}
-          <button
-            className="button primary full-width"
-            disabled={
-              newPending ||
-              workspaceChecking ||
-              !currentProvider?.available ||
-              !project?.trusted ||
-              health.storage === 'error'
-            }
-            onClick={() => void createSession()}
-          >
-            {newPending ? <LoaderCircle size={16} className="spin" /> : <MessageSquare size={16} />}
-            开始会话
-            <ArrowRight size={15} />
-          </button>
-        </div>
-      </Modal>
       <Modal
         open={settingsOpen}
         onOpenChange={(value) => {

@@ -52,6 +52,78 @@ const context = (id: string): AgentContext => ({
 })
 
 describe('OpenCode stable HTTP/SSE transport', () => {
+  it('discovers native variants and sends explicit selections for new and resumed sessions', async () => {
+    fixture.script = `
+      const http=require('http');const streams=[];let created=0;
+      const auth='Basic '+Buffer.from('opencode:'+process.env.OPENCODE_SERVER_PASSWORD).toString('base64');
+      const event=(type,properties)=>streams.forEach(s=>s.write('data: '+JSON.stringify({type,properties})+'\\n\\n'));
+      http.createServer((req,res)=>{
+        if(req.headers.authorization!==auth){res.writeHead(401);res.end();return}
+        const path=new URL(req.url,'http://localhost').pathname;
+        const json=value=>{res.setHeader('content-type','application/json');res.end(JSON.stringify(value))};
+        if(path==='/global/health'){json({healthy:true,version:'1.19.5'});return}
+        if(path==='/event'){res.writeHead(200,{'content-type':'text/event-stream'});res.write(':ready\\n\\n');streams.push(res);return}
+        if(path==='/provider'){json({all:[{id:'test',name:'Test',models:{model:{name:'Native model',description:'Model description',variants:{careful:{reasoningEffort:'high'},'custom-fast':{budget:10}}},legacy:{name:'Legacy'}}},{id:'disconnected',models:{hidden:{name:'Hidden',variants:{high:{}}}}}],connected:['test']});return}
+        let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
+          const body=raw?JSON.parse(raw):{};
+          if(path==='/session'&&req.method==='POST'){json({id:'created-'+(++created)});return}
+          if(path==='/session/existing'){json({id:'existing'});return}
+          if(path.endsWith('/message')){json([]);return}
+          if(path.endsWith('/prompt_async')){
+            const text=body.parts[0].text;
+            const valid=text==='defaults'
+              ? !Object.hasOwn(body,'model')&&!Object.hasOwn(body,'variant')
+              : body.model?.providerID==='test'&&body.model.modelID==='model'&&body.variant===(text==='resume'?'custom-fast':'careful');
+            if(!valid){res.writeHead(400);res.end('Unexpected model or variant');return}
+            const sessionID=path.split('/')[2];res.writeHead(204);res.end();
+            event('session.status',{sessionID,status:{type:'busy'}});event('session.status',{sessionID,status:{type:'idle'}});return
+          }
+          res.writeHead(404);res.end();
+        });
+      }).listen(Number(process.argv[1]),'127.0.0.1');
+    `
+    const events: AgentEvent[] = []
+    const adapter = new OpenCodeAdapter((event) => events.push(event))
+    adapters.push(adapter)
+    expect(await adapter.models(process.execPath, '/tmp')).toEqual([
+      {
+        id: 'test/model',
+        name: 'Test / Native model',
+        description: 'Model description',
+        reasoning: {
+          kind: 'variant',
+          options: [
+            { value: 'careful', label: 'careful' },
+            { value: 'custom-fast', label: 'custom-fast' },
+          ],
+        },
+      },
+      { id: 'test/legacy', name: 'Test / Legacy' },
+    ])
+    for (const [text, selection] of [
+      ['defaults', { model: undefined, reasoningOption: undefined }],
+      ['explicit', { model: 'test/model', reasoningOption: 'careful' }],
+      ['resume', { model: 'test/model', reasoningOption: 'custom-fast', nativeId: 'existing' }],
+    ] as const) {
+      const selected = context(text)
+      await adapter.send(
+        { ...selected, session: { ...selected.session, ...selection } },
+        text,
+        text,
+      )
+      await vi.waitFor(() =>
+        expect(events.some((event) => event.sessionId === text && event.kind === 'done')).toBe(
+          true,
+        ),
+      )
+      expect(events.filter((event) => event.sessionId === text && event.kind === 'error')).toEqual(
+        [],
+      )
+    }
+    expect(
+      events.find((event) => event.sessionId === 'resume' && event.kind === 'session'),
+    ).toMatchObject({ nativeId: 'existing' })
+  })
   it('retains failed permission replies and failed stops until the native server acknowledges them', async () => {
     fixture.script = `
       const http=require('http');let replies=0,aborts=0;const streams=[];

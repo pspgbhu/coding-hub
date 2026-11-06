@@ -21,9 +21,9 @@ const send=m=>process.stdout.write(JSON.stringify(m)+'\n');let threadId='',turnI
 const complete=text=>{send({method:'item/agentMessage/delta',params:{threadId,turnId,itemId:'answer-'+turnId,delta:text}});send({method:'turn/completed',params:{threadId,turn:{id:turnId,status:'completed'}}})};
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line),p=m.params||{};
 if(m.method==='initialize')send({id:m.id,result:{userAgent:'fixture'}});
-if(m.method==='model/list')send({id:m.id,result:{data:[{id:'fixture-model',displayName:'Fixture model'}]}});
+if(m.method==='model/list')send({id:m.id,result:{data:[{id:'fixture-model',displayName:'Fixture model',description:'Isolated Codex model',isDefault:true,defaultReasoningEffort:'medium',supportedReasoningEfforts:[{reasoningEffort:'low',description:'Fast fixture reasoning'},{reasoningEffort:'medium',description:'Balanced fixture reasoning'},{reasoningEffort:'high',description:'Thorough fixture reasoning'}]},{id:'fixture-precise',displayName:'Fixture precise',defaultReasoningEffort:'high',supportedReasoningEfforts:[{reasoningEffort:'high',description:'Precise fixture reasoning'}]},{id:'fixture-legacy',displayName:'Fixture legacy'}],nextCursor:null}});
 if(m.method==='thread/start'||m.method==='thread/resume'){threadId=p.threadId||crypto.randomUUID();send({id:m.id,result:{thread:{id:threadId}}})}
-if(m.method==='turn/start'){turnId=crypto.randomUUID();send({id:m.id,result:{turn:{id:turnId}}});const text=p.input?.find(i=>i.type==='text')?.text||'';
+if(m.method==='turn/start'){fs.appendFileSync(__filename+'.requests',JSON.stringify({provider:'codex',cwd:process.cwd(),nativeId:threadId,model:p.model??null,effort:p.effort??null,input:p.input})+'\n');turnId=crypto.randomUUID();send({id:m.id,result:{turn:{id:turnId}}});const text=p.input?.find(i=>i.type==='text')?.text||'';
 if(text.includes('approval'))send({id:800,method:'item/commandExecution/requestApproval',params:{threadId,turnId,itemId:'tool',command:'printf fixture-approved',reason:'Fixture permission request',availableDecisions:['accept','decline']}});
 else if(text.includes('question'))send({id:801,method:'item/tool/requestUserInput',params:{threadId,turnId,questions:[{id:'format',question:'选择输出格式',options:[{label:'JSON'},{label:'文本'}]}]}});
 else if(text.includes('permission-profile'))send({id:802,method:'item/permissions/requestApproval',params:{threadId,turnId,reason:'Fixture permission profile request',permissions:{network:{enabled:true}}}});
@@ -38,15 +38,15 @@ if(m.method==='turn/interrupt'){clearInterval(timer);send({id:m.id,result:{}});s
 });process.stdin.on('end',()=>process.exit(0));
 `
 const claudeSource = String.raw`
-const crypto=require('node:crypto'),readline=require('node:readline');
+const fs=require('node:fs'),crypto=require('node:crypto'),readline=require('node:readline');
 if(process.argv.includes('--version')){console.log('Claude Code 2.1.236');process.exit(0)}
 const send=m=>process.stdout.write(JSON.stringify(m)+'\n');
 const nativeId=(process.argv.find(a=>a.startsWith('--resume='))||'').slice(9)||crypto.randomUUID();let timer;
 const complete=text=>{const id=crypto.randomUUID();send({type:'stream_event',session_id:nativeId,event:{type:'message_start',message:{id}}});send({type:'stream_event',session_id:nativeId,event:{type:'content_block_delta',index:0,delta:{type:'text_delta',text}}});send({type:'assistant',session_id:nativeId,message:{id,content:[{type:'text',text}]}});send({type:'result',subtype:'success',is_error:false,session_id:nativeId,result:text,usage:{input_tokens:5,output_tokens:2},total_cost_usd:0})};
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
-if(m.type==='control_request'&&m.request.subtype==='initialize')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{commands:[],agents:[],output_style:'default',available_output_styles:[],models:[{value:'fixture-model',displayName:'Fixture model',description:'Isolated CLI fixture'}],account:{}}}});
+if(m.type==='control_request'&&m.request.subtype==='initialize')send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{commands:[],agents:[],output_style:'default',available_output_styles:[],models:[{value:'fixture-model',displayName:'Fixture Claude model',description:'Isolated CLI fixture',supportsEffort:true,supportedEffortLevels:['low','high']}],account:{}}}});
 if(m.type==='control_request'&&m.request.subtype==='interrupt'){clearInterval(timer);send({type:'control_response',response:{subtype:'success',request_id:m.request_id,response:{}}})}
-if(m.type==='user'){send({type:'system',subtype:'init',session_id:nativeId,uuid:crypto.randomUUID()});const text=typeof m.message.content==='string'?m.message.content:m.message.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
+if(m.type==='user'){const flag=name=>{const index=process.argv.indexOf(name);return index>=0?process.argv[index+1]:null};fs.appendFileSync(__filename+'.requests',JSON.stringify({provider:'claude',cwd:process.cwd(),nativeId,model:flag('--model'),effort:flag('--effort')})+'\n');send({type:'system',subtype:'init',session_id:nativeId,uuid:crypto.randomUUID()});const text=typeof m.message.content==='string'?m.message.content:m.message.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
 if(text.includes('approval'))send({type:'control_request',request_id:'approval',request:{subtype:'can_use_tool',tool_name:'Bash',input:{command:'printf fixture-approved'},tool_use_id:'tool'}});
 else if(text.includes('long-running'))timer=setInterval(()=>{},1000);
 else setTimeout(()=>complete('CLAUDE_TRANSPORT_OK 中文流式输出'),30)}
@@ -54,7 +54,7 @@ if(m.type==='control_response'&&m.response.request_id==='approval')complete(m.re
 });process.stdin.on('end',()=>process.exit(0));
 `
 const opencodeSource = String.raw`
-const http=require('node:http'),crypto=require('node:crypto');
+const fs=require('node:fs'),http=require('node:http'),crypto=require('node:crypto');
 if(process.argv.includes('--version')){console.log('1.19.5');process.exit(0)}
 const port=Number(process.argv[process.argv.indexOf('--port')+1]);const streams=new Set(),sessions=new Map();
 const auth='Basic '+Buffer.from('opencode:'+process.env.OPENCODE_SERVER_PASSWORD).toString('base64');
@@ -64,11 +64,11 @@ http.createServer((req,res)=>{if(req.headers.authorization!==auth){res.writeHead
 if(path==='/event'){res.writeHead(200,{'content-type':'text/event-stream'});res.write(': connected\n\n');streams.add(res);req.on('close',()=>streams.delete(res));return}
 let raw='';req.on('data',b=>raw+=b);req.on('end',()=>{const body=raw?JSON.parse(raw):{};
 if(path==='/global/health'){json({healthy:true,version:'1.19.5'});return}
-if(path==='/provider'){json({all:[{id:'fixture',name:'Fixture',models:{model:{name:'Fixture model'}}}],connected:['fixture']});return}
+if(path==='/provider'){json({all:[{id:'fixture',name:'Fixture',models:{model:{name:'Fixture model',variants:{careful:{reasoningEffort:'high'},'custom-fast':{budget:10}}}}}],connected:['fixture']});return}
 if(path==='/session'&&req.method==='POST'){const id=crypto.randomUUID();sessions.set(id,{messages:[]});json({id});return}
 const match=path.match(/^\/session\/([^/]+)(?:\/(.*))?$/);if(match){const id=match[1],action=match[2];if(!sessions.has(id)){res.writeHead(404);res.end();return}
 if(!action){json({id});return}if(action==='message'){json(sessions.get(id).messages);return}if(action==='abort'){json(true);event('session.status',{sessionID:id,status:{type:'idle'}});return}
-if(action==='prompt_async'){res.writeHead(204);res.end();event('session.status',{sessionID:id,status:{type:'busy'}});const text=body.parts.filter(p=>p.type==='text').map(p=>p.text).join('\n');if(text.includes('approval'))event('permission.asked',{id:'approval-'+id,sessionID:id,permission:'bash',patterns:['printf fixture-approved'],metadata:{}});else if(!text.includes('long-running'))setTimeout(()=>complete(id,'OPENCODE_TRANSPORT_OK 中文流式输出'),30);return}}
+if(action==='prompt_async'){fs.appendFileSync(__filename+'.requests',JSON.stringify({provider:'opencode',cwd:process.cwd(),nativeId:id,model:body.model??null,variant:body.variant??null})+'\n');res.writeHead(204);res.end();event('session.status',{sessionID:id,status:{type:'busy'}});const text=body.parts.filter(p=>p.type==='text').map(p=>p.text).join('\n');if(text.includes('approval'))event('permission.asked',{id:'approval-'+id,sessionID:id,permission:'bash',patterns:['printf fixture-approved'],metadata:{}});else if(!text.includes('long-running'))setTimeout(()=>complete(id,'OPENCODE_TRANSPORT_OK 中文流式输出'),30);return}}
 if(path.startsWith('/permission/')){const id=path.split('/')[2].slice(9);json(true);complete(id,body.reply==='reject'?'OPENCODE_DECLINED':'OPENCODE_APPROVED');return}
 res.writeHead(404);res.end();});}).listen(port,'127.0.0.1');
 `
@@ -224,20 +224,23 @@ export async function createSession(
   workspace: 'shared' | 'isolated' = 'shared',
 ) {
   await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
-  const dialog = page.getByRole('dialog', { name: '新建会话', exact: true })
-  const name = { codex: 'Codex', claude: 'Claude Code', opencode: 'OpenCode' }[provider]
-  await dialog
-    .getByRole('button')
-    .filter({ has: page.getByText(name, { exact: true }) })
-    .click()
-  await dialog.locator('#session-workspace').selectOption(workspace)
-  await dialog.getByRole('button', { name: '开始会话', exact: true }).click()
-  await expect(dialog).toHaveCount(0)
+  // Existing suites require an empty session. Exercise the real typed preload
+  // API for that setup; new-session.spec.ts covers the first-send UI flow.
+  const session = await page.evaluate(
+    async ({ provider, workspace }) => {
+      const state = await window.hub.bootstrap()
+      return window.hub.createSession({
+        projectId: state.settings.lastProjectId!,
+        provider,
+        model: provider === 'opencode' ? 'fixture/model' : 'fixture-model',
+        isolated: workspace === 'isolated',
+      })
+    },
+    { provider, workspace },
+  )
+  await page.locator(`[data-session-id="${session.id}"] .session-select`).click()
   await expect(page.getByRole('textbox', { name: '消息输入框', exact: true })).toBeVisible()
-  return page.evaluate(async () => {
-    const state = await window.hub.bootstrap()
-    return state.sessions.find((s) => s.id === state.settings.lastSessionId)!
-  })
+  return session
 }
 export async function sendMessage(page: Page, text: string) {
   await page.getByRole('textbox', { name: '消息输入框', exact: true }).fill(text)

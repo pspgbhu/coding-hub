@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { Store } from '../src/main/store'
 import { ApplicationServices } from '../src/main/application'
 import type { RuntimeClient } from '../src/main/runtime-client'
+import type { NewSessionDraft, Session } from '../src/shared/types'
 
 const env = vi.hoisted(() => ({ dataDir: '' }))
 vi.mock('electron', () => ({
@@ -39,6 +40,13 @@ class FixtureRuntime extends EventEmitter {
         hasHead: true,
       }
     if (method === 'agent.interrupt' && this.stopFails) throw new Error('native abort failed')
+    if (method === 'workspace.createWorktree')
+      return {
+        rootPath: args[1],
+        canonicalId: 'isolated',
+        repositoryId: 'repository',
+        hasHead: true,
+      }
     return undefined
   }
 }
@@ -62,6 +70,442 @@ function session(trusted = true) {
   store.patchProject(project.id, { trusted })
   return store.createSession(project.id, 'codex')
 }
+function pendingDraft(projectId: string, patch: Partial<NewSessionDraft> = {}) {
+  const draft = {
+    ...(services.handlers.getNewSessionDraft(projectId) as NewSessionDraft),
+    text: 'first task',
+    updatedAt: 10,
+    ...patch,
+  }
+  services.handlers.saveNewSessionDraft(projectId, draft)
+  return draft
+}
+
+describe('new session draft handoff', () => {
+  it('round-trips optional model defaults through validated settings and creates only on handoff', async () => {
+    const current = session()
+    services.handlers.saveSettings({
+      theme: 'system',
+      cliPaths: {},
+      newSessionDefaults: {
+        [current.projectId]: { provider: 'claude', model: 'sonnet', reasoningOption: 'high' },
+      },
+    })
+    const draft = pendingDraft(current.projectId)
+    expect(draft).toMatchObject({
+      provider: 'claude',
+      model: 'sonnet',
+      reasoningOption: 'high',
+      workspace: { kind: 'shared' },
+    })
+    expect(store.findSession(draft.id)).toBeUndefined()
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    expect(created).toMatchObject({
+      id: draft.id,
+      workspaceId: current.projectId,
+      model: 'sonnet',
+      reasoningOption: 'high',
+    })
+    expect(store.getDraft(created.id).text).toBe('first task')
+    expect(runtime.calls.some((call) => call.method === 'agent.send')).toBe(false)
+    expect(await services.handlers.createSessionFromDraft(current.projectId, draft.id)).toEqual(
+      created,
+    )
+  })
+
+  it('coalesces concurrent isolated handoffs and reuses their worktree on retries', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId, { workspace: { kind: 'isolated' } })
+    const [first, second] = (await Promise.all([
+      services.handlers.createSessionFromDraft(current.projectId, draft.id),
+      services.handlers.createSessionFromDraft(current.projectId, draft.id),
+    ])) as Session[]
+    expect(first).toEqual(second)
+    expect(first.workspaceId).toBe(draft.id)
+    expect(runtime.calls.filter((call) => call.method === 'workspace.createWorktree')).toHaveLength(
+      1,
+    )
+    await services.handlers.createSessionFromDraft(current.projectId, draft.id)
+    expect(runtime.calls.filter((call) => call.method === 'workspace.createWorktree')).toHaveLength(
+      1,
+    )
+  })
+
+  it('reuses an already created worktree after a failed handoff is recovered', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId, { workspace: { kind: 'isolated' } })
+    vi.spyOn(store, 'saveSettings').mockImplementationOnce(() => {
+      throw new Error('SQLITE_FULL')
+    })
+    await expect(
+      services.handlers.createSessionFromDraft(current.projectId, draft.id),
+    ).rejects.toThrow('SQLITE_FULL')
+    expect(store.findSession(draft.id)).toBeUndefined()
+    expect(store.getNewSessionDraft(current.projectId)).toEqual(draft)
+    await services.handlers.retryStorage()
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    expect(created.workspaceId).toBe(draft.id)
+    expect(runtime.calls.filter((call) => call.method === 'workspace.createWorktree')).toHaveLength(
+      1,
+    )
+  })
+
+  it('preserves the existing create-session API while accepting a reasoning option', async () => {
+    const current = session()
+    const created = (await services.handlers.createSession({
+      projectId: current.projectId,
+      provider: 'codex',
+      model: 'selected-model',
+      reasoningOption: 'high',
+    })) as Session
+    expect(created).toMatchObject({
+      projectId: current.projectId,
+      workspaceId: current.projectId,
+      model: 'selected-model',
+      reasoningOption: 'high',
+    })
+    expect(store.getDraft(created.id)).toEqual({ text: '', context: [], updatedAt: 0 })
+  })
+
+  it('rejects another project workspace while preserving the pending draft', async () => {
+    const current = session()
+    const other = session()
+    const draft = pendingDraft(current.projectId, {
+      workspace: { kind: 'existing', id: other.projectId },
+    })
+    await expect(
+      services.handlers.createSessionFromDraft(current.projectId, draft.id),
+    ).rejects.toThrow('工作区不属于')
+    expect(store.findSession(draft.id)).toBeUndefined()
+    expect(store.getNewSessionDraft(current.projectId)).toEqual(draft)
+    expect(services.healthState.storage).toBe('ready')
+  })
+
+  it('rejects untrusted handoffs and invalid pending draft shapes before creating a session', async () => {
+    const current = session(false)
+    const draft = pendingDraft(current.projectId)
+    expect(() =>
+      services.handlers.saveNewSessionDraft(current.projectId, {
+        ...draft,
+        workspace: { kind: 'existing', id: 'not-an-id' },
+      }),
+    ).toThrow()
+    await expect(
+      services.handlers.createSessionFromDraft(current.projectId, draft.id),
+    ).rejects.toThrow('PROJECT_UNTRUSTED')
+    expect(store.findSession(draft.id)).toBeUndefined()
+    expect(store.getNewSessionDraft(current.projectId)).toEqual(draft)
+  })
+
+  it('accepts the first message once and clears its matching draft before dispatch returns', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    const dispatch = runtime.call.bind(runtime)
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'agent.send') {
+        expect(store.getDraft(created.id).text).toBe('')
+        expect(store.view(created.id).events[0].id).toBe(created.id)
+      }
+      return dispatch(method, ...args)
+    })
+    const input = { text: draft.text, context: draft.context }
+    const options = { firstMessage: true, draftUpdatedAt: draft.updatedAt }
+    await services.handlers.sendMessage(created.id, input, options)
+    await services.handlers.sendMessage(created.id, input, options)
+    store.patchSession(created.id, { status: 'idle' })
+    await services.handlers.sendMessage(created.id, input, options)
+    expect(runtime.calls.filter((call) => call.method === 'agent.send')).toHaveLength(1)
+    expect(store.view(created.id).events.filter((event) => event.kind === 'user')).toHaveLength(1)
+  })
+
+  it('preserves the first draft when dispatch preparation fails, then retries in the same session', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    const dispatch = runtime.call.bind(runtime)
+    let fail = true
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'review.capture' && fail) {
+        fail = false
+        throw new Error('capture failed')
+      }
+      return dispatch(method, ...args)
+    })
+    const input = { text: draft.text, context: draft.context }
+    const options = { firstMessage: true, draftUpdatedAt: draft.updatedAt }
+    await expect(services.handlers.sendMessage(created.id, input, options)).rejects.toThrow(
+      'capture failed',
+    )
+    expect(store.getDraft(created.id).text).toBe(draft.text)
+    expect(store.view(created.id).events).toHaveLength(0)
+    await services.handlers.sendMessage(created.id, input, options)
+    expect(store.getDraft(created.id).text).toBe('')
+    expect(runtime.calls.filter((call) => call.method === 'agent.send')).toHaveLength(1)
+  })
+
+  it('does not redispatch an accepted first message when the native dispatch response fails', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    const dispatch = runtime.call.bind(runtime)
+    let attempts = 0
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'agent.send') {
+        attempts++
+        throw new Error('native response lost')
+      }
+      return dispatch(method, ...args)
+    })
+    const input = { text: draft.text, context: draft.context }
+    const options = { firstMessage: true, draftUpdatedAt: draft.updatedAt }
+    await expect(services.handlers.sendMessage(created.id, input, options)).rejects.toThrow(
+      'native response lost',
+    )
+    expect(store.getDraft(created.id).text).toBe('')
+    await services.handlers.sendMessage(created.id, input, options)
+    expect(attempts).toBe(1)
+    expect(store.view(created.id).events.filter((event) => event.kind === 'user')).toHaveLength(1)
+  })
+
+  it('preserves a newer session draft edited while the first submission is preparing', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    const dispatch = runtime.call.bind(runtime)
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'review.capture')
+        store.saveDraft(created.id, {
+          text: 'newer task',
+          context: [],
+          updatedAt: draft.updatedAt + 1,
+        })
+      return dispatch(method, ...args)
+    })
+    await services.handlers.sendMessage(
+      created.id,
+      { text: draft.text, context: draft.context },
+      { firstMessage: true, draftUpdatedAt: draft.updatedAt },
+    )
+    expect(store.getDraft(created.id).text).toBe('newer task')
+  })
+
+  it('rolls back first-message acceptance when clearing its draft cannot be persisted', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const created = (await services.handlers.createSessionFromDraft(
+      current.projectId,
+      draft.id,
+    )) as Session
+    vi.spyOn(store, 'saveDraft').mockImplementationOnce(() => {
+      throw new Error('SQLITE_FULL')
+    })
+    await expect(
+      services.handlers.sendMessage(
+        created.id,
+        { text: draft.text, context: [] },
+        { firstMessage: true, draftUpdatedAt: draft.updatedAt },
+      ),
+    ).rejects.toThrow('SQLITE_FULL')
+    expect(store.getDraft(created.id).text).toBe(draft.text)
+    expect(store.view(created.id).events).toHaveLength(0)
+    expect(store.session(created.id).status).toBe('idle')
+    expect(runtime.calls.some((call) => call.method === 'agent.send')).toBe(false)
+  })
+
+  it('rejects pre-restore pending writes, creation and sends without replacing restored drafts', async () => {
+    const current = session()
+    const draft = pendingDraft(current.projectId)
+    const old = services.handlers.bootstrap() as { dataGeneration: string }
+    const backup = store.createBackup()
+    services.handlers.saveNewSessionDraft(current.projectId, {
+      ...draft,
+      text: 'later',
+      updatedAt: 20,
+    })
+    await services.handlers.restoreBackup(backup.id)
+    expect(() =>
+      services.handlers.saveNewSessionDraft(
+        current.projectId,
+        { ...draft, text: 'stale', updatedAt: 100 },
+        old.dataGeneration,
+      ),
+    ).toThrow('STALE_DATA_GENERATION')
+    await expect(
+      services.handlers.createSessionFromDraft(current.projectId, draft.id, old.dataGeneration),
+    ).rejects.toThrow('STALE_DATA_GENERATION')
+    await expect(
+      services.handlers.sendMessage(current.id, 'stale', undefined, old.dataGeneration),
+    ).rejects.toThrow('STALE_DATA_GENERATION')
+    expect(store.getNewSessionDraft(current.projectId)).toEqual(draft)
+  })
+
+  it('supports idle reasoning changes and clears old reasoning on model changes', async () => {
+    const current = session()
+    services.handlers.updateSession(current.id, { reasoningOption: 'high' })
+    expect(store.session(current.id).reasoningOption).toBe('high')
+    services.handlers.updateSession(current.id, { model: 'another-model' })
+    expect(store.session(current.id).reasoningOption).toBeUndefined()
+    services.handlers.updateSession(current.id, { reasoningOption: 'low' })
+    services.handlers.updateSession(current.id, { reasoningOption: null })
+    expect(store.session(current.id).reasoningOption).toBeUndefined()
+    store.patchSession(current.id, { status: 'running' })
+    expect(() => services.handlers.updateSession(current.id, { reasoningOption: 'high' })).toThrow(
+      '请先停止',
+    )
+  })
+})
+
+describe('versioned ordinary message acceptance', () => {
+  it('rejects model and reasoning edits while review capture holds a startup reservation', async () => {
+    const current = session()
+    store.patchSession(current.id, { model: 'original-model', reasoningOption: 'low' })
+    let release!: () => void
+    const paused = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let captured!: () => void
+    const captureStarted = new Promise<void>((resolve) => {
+      captured = resolve
+    })
+    const dispatch = runtime.call.bind(runtime)
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'review.capture') {
+        captured()
+        await paused
+      }
+      return dispatch(method, ...args)
+    })
+    const sending = services.handlers.sendMessage(current.id, 'ordinary task')
+    await captureStarted
+    try {
+      expect(store.session(current.id).status).toBe('idle')
+      expect(() => services.handlers.updateSession(current.id, { model: 'changed-model' })).toThrow(
+        'WORKSPACE_BUSY',
+      )
+      expect(() =>
+        services.handlers.updateSession(current.id, { reasoningOption: 'high' }),
+      ).toThrow('WORKSPACE_BUSY')
+      expect(() =>
+        services.handlers.updateSession(current.id, { title: 'renamed while preparing' }),
+      ).not.toThrow()
+    } finally {
+      release()
+    }
+    await sending
+    const sent = runtime.calls.find((call) => call.method === 'agent.send')!
+    expect((sent.args[0] as { session: Session }).session).toMatchObject({
+      model: 'original-model',
+      reasoningOption: 'low',
+    })
+  })
+
+  it('dispatches the latest configuration changed before the startup reservation is acquired', async () => {
+    const current = session()
+    store.patchSession(current.id, { model: 'original-model', reasoningOption: 'low' })
+    let release!: () => void
+    const paused = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let inspecting!: () => void
+    const inspectStarted = new Promise<void>((resolve) => {
+      inspecting = resolve
+    })
+    const dispatch = runtime.call.bind(runtime)
+    let firstInspection = true
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'workspace.inspect' && firstInspection) {
+        firstInspection = false
+        inspecting()
+        await paused
+      }
+      return dispatch(method, ...args)
+    })
+    const sending = services.handlers.sendMessage(current.id, 'ordinary task')
+    await inspectStarted
+    try {
+      services.handlers.updateSession(current.id, {
+        model: 'changed-model',
+        reasoningOption: 'high',
+      })
+    } finally {
+      release()
+    }
+    await sending
+    const sent = runtime.calls.find((call) => call.method === 'agent.send')!
+    expect((sent.args[0] as { session: Session }).session).toMatchObject({
+      model: 'changed-model',
+      reasoningOption: 'high',
+    })
+  })
+
+  it('clears a matching draft in the user event transaction before ordinary dispatch', async () => {
+    const current = session()
+    const draft = { text: 'ordinary task', context: [], updatedAt: 10 }
+    store.saveDraft(current.id, draft)
+    const dispatch = runtime.call.bind(runtime)
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'agent.send') {
+        expect(store.getDraft(current.id).text).toBe('')
+        expect(store.view(current.id).events[0].text).toBe(draft.text)
+      }
+      return dispatch(method, ...args)
+    })
+    await services.handlers.sendMessage(
+      current.id,
+      { text: draft.text, context: draft.context },
+      { draftUpdatedAt: draft.updatedAt },
+    )
+    expect(store.getDraft(current.id).updatedAt).toBeGreaterThan(draft.updatedAt)
+    expect(store.view(current.id).events[0].id).not.toBe(current.id)
+  })
+
+  it('preserves a newer draft saved while an ordinary submission is preparing', async () => {
+    const current = session()
+    const draft = { text: 'ordinary task', context: [], updatedAt: 10 }
+    const newer = { text: 'next task typed after switching back', context: [], updatedAt: 11 }
+    store.saveDraft(current.id, draft)
+    const dispatch = runtime.call.bind(runtime)
+    vi.spyOn(runtime, 'call').mockImplementation(async (method, ...args) => {
+      if (method === 'review.capture') store.saveDraft(current.id, newer)
+      return dispatch(method, ...args)
+    })
+    await services.handlers.sendMessage(
+      current.id,
+      { text: draft.text, context: draft.context },
+      { draftUpdatedAt: draft.updatedAt },
+    )
+    expect(store.getDraft(current.id)).toEqual(newer)
+    expect(store.view(current.id).events[0].text).toBe(draft.text)
+  })
+
+  it('keeps existing callers responsible for draft clearing when no version is supplied', async () => {
+    const current = session()
+    const draft = { text: 'legacy task', context: [], updatedAt: 10 }
+    store.saveDraft(current.id, draft)
+    await services.handlers.sendMessage(current.id, { text: draft.text, context: draft.context })
+    expect(store.getDraft(current.id)).toEqual(draft)
+    expect(store.view(current.id).events[0].text).toBe(draft.text)
+  })
+})
 
 describe('desktop orchestration safety', () => {
   it('persists only sanitized native tool and permission copies without modifying native inputs', () => {

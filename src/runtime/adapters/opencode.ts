@@ -379,6 +379,9 @@ export class OpenCodeAdapter {
         })),
       ],
       ...(selectedModel ? { model: selectedModel } : {}),
+      ...(selectedModel && state.turn.context.session.reasoningOption
+        ? { variant: state.turn.context.session.reasoningOption }
+        : {}),
     })
   }
   private event(server: Server, event: Json): void {
@@ -606,10 +609,19 @@ export class OpenCodeAdapter {
       return (data.all ?? [])
         .filter((provider: Json) => data.connected?.includes(provider.id))
         .flatMap((provider: Json) =>
-          Object.entries(provider.models ?? {}).map(([id, model]) => ({
-            id: `${provider.id}/${id}`,
-            name: `${provider.name ?? provider.id} / ${(model as Json).name ?? id}`,
-          })),
+          Object.entries(provider.models ?? {}).map(([id, value]) => {
+            const model = value as Json
+            const options = Object.keys(model.variants ?? {}).map((variant) => ({
+              value: variant,
+              label: variant,
+            }))
+            return {
+              id: `${provider.id}/${id}`,
+              name: `${provider.name ?? provider.id} / ${model.name ?? id}`,
+              ...(typeof model.description === 'string' ? { description: model.description } : {}),
+              ...(options.length ? { reasoning: { kind: 'variant' as const, options } } : {}),
+            }
+          }),
         )
     } finally {
       if (temporary && server) await this.stopServer(server)

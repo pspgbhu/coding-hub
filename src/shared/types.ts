@@ -36,6 +36,7 @@ export interface Session {
   provider: ProviderId
   title: string
   model?: string
+  reasoningOption?: string
   nativeId?: string
   activeTurnId?: string
   status: SessionStatus
@@ -49,6 +50,13 @@ export interface Session {
 export interface Model {
   id: string
   name: string
+  description?: string
+  isDefault?: boolean
+  reasoning?: {
+    kind: 'effort' | 'variant'
+    options: { value: string; label: string; description?: string }[]
+    default?: string
+  }
 }
 export interface ProviderInfo {
   id: ProviderId
@@ -85,6 +93,10 @@ export interface Settings {
   sidebarWidth?: number
   workspaceWidth?: number
   terminalHeight?: number
+  newSessionDefaults?: Record<
+    string,
+    { provider: ProviderId; model?: string; reasoningOption?: string }
+  >
 }
 export interface ContextItem {
   id: string
@@ -103,6 +115,13 @@ export interface TurnInput {
 }
 export interface ComposerDraft extends TurnInput {
   updatedAt: number
+}
+export interface NewSessionDraft extends ComposerDraft {
+  id: string
+  provider: ProviderId
+  model?: string
+  reasoningOption?: string
+  workspace: { kind: 'shared' } | { kind: 'isolated' } | { kind: 'existing'; id: string }
 }
 export interface EditorState {
   files: (FileContent & { edited: string; external?: FileContent; viewState?: unknown })[]
@@ -368,10 +387,14 @@ export interface AppAPI {
     projectId: string
     provider: ProviderId
     model?: string
+    reasoningOption?: string
     workspaceId?: string
     isolated?: boolean
     base?: string
   }): Promise<Session>
+  getNewSessionDraft(projectId: string): Promise<NewSessionDraft>
+  saveNewSessionDraft(projectId: string, draft: NewSessionDraft): Promise<void>
+  createSessionFromDraft(projectId: string, draftId: string): Promise<Session>
   getSession(id: string, page?: SessionPage): Promise<SessionView>
   searchSessions(query: string): Promise<SessionSearchResult[]>
   updateSession(
@@ -380,12 +403,17 @@ export interface AppAPI {
       title?: string
       archived?: boolean
       model?: string
+      reasoningOption?: string | null
       pinned?: boolean
       deletedAt?: number | null
       readAt?: number
     },
   ): Promise<Session>
-  sendMessage(id: string, input: string | TurnInput): Promise<void>
+  sendMessage(
+    id: string,
+    input: string | TurnInput,
+    options?: { firstMessage?: boolean; draftUpdatedAt?: number },
+  ): Promise<void>
   getDraft(sessionId: string): Promise<ComposerDraft>
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>
   getEditorState(workspaceId: string): Promise<EditorState | null>
