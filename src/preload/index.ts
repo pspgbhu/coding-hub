@@ -5,6 +5,9 @@ const methods = [
   'addProject',
   'removeProject',
   'createSession',
+  'getNewSessionDraft',
+  'saveNewSessionDraft',
+  'createSessionFromDraft',
   'getSession',
   'searchSessions',
   'updateSession',
@@ -97,7 +100,14 @@ api.onPrepareClose = (callback: () => Promise<void>) => {
 let dataGeneration: string | undefined
 for (const method of methods)
   api[method] = async (...args: unknown[]) => {
-    if (method === 'saveDraft' || method === 'saveEditorState') args.push(dataGeneration)
+    if (
+      method === 'saveDraft' ||
+      method === 'saveEditorState' ||
+      method === 'saveNewSessionDraft' ||
+      method === 'createSessionFromDraft'
+    )
+      args.push(dataGeneration)
+    if (method === 'sendMessage') args[3] = dataGeneration
     const result = await ipcRenderer.invoke(`hub:${method}`, ...args)
     if (method === 'bootstrap' && dataGeneration === undefined)
       dataGeneration = result.dataGeneration

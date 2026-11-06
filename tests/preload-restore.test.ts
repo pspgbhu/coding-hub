@@ -26,6 +26,53 @@ afterEach(() => {
 })
 
 describe('fixed backup restore preload refresh', () => {
+  it('guards new-session persistence, handoff and both send signatures with the bootstrap generation', async () => {
+    fixture.invoke.mockResolvedValueOnce({ dataGeneration: 'fixture-generation' })
+    await fixture.api.bootstrap()
+    fixture.invoke.mockResolvedValue(undefined)
+    await fixture.api.getNewSessionDraft('project')
+    expect(fixture.invoke).toHaveBeenLastCalledWith('hub:getNewSessionDraft', 'project')
+    const draft = {
+      id: 'draft',
+      text: 'task',
+      context: [],
+      updatedAt: 1,
+      provider: 'codex' as const,
+      workspace: { kind: 'shared' as const },
+    }
+    await fixture.api.saveNewSessionDraft('project', draft)
+    expect(fixture.invoke).toHaveBeenLastCalledWith(
+      'hub:saveNewSessionDraft',
+      'project',
+      draft,
+      'fixture-generation',
+    )
+    await fixture.api.createSessionFromDraft('project', 'draft')
+    expect(fixture.invoke).toHaveBeenLastCalledWith(
+      'hub:createSessionFromDraft',
+      'project',
+      'draft',
+      'fixture-generation',
+    )
+    await fixture.api.sendMessage('session', 'ordinary task')
+    expect(fixture.invoke).toHaveBeenLastCalledWith(
+      'hub:sendMessage',
+      'session',
+      'ordinary task',
+      undefined,
+      'fixture-generation',
+    )
+    const options = { firstMessage: true, draftUpdatedAt: 1 }
+    await fixture.api.sendMessage('session', { text: 'task', context: [] }, options)
+    expect(fixture.invoke).toHaveBeenLastCalledWith(
+      'hub:sendMessage',
+      'session',
+      { text: 'task', context: [] },
+      options,
+      'fixture-generation',
+    )
+  })
+
   it('reloads once after a successful restore to renew the generation and all renderer caches', async () => {
     fixture.invoke.mockResolvedValue(undefined)
     await expect(fixture.api.restoreBackup('selected-backup')).resolves.toBeUndefined()

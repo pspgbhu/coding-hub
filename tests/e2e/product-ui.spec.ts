@@ -357,13 +357,21 @@ test('an unborn repository defaults to shared workspace and command shortcuts st
   const { page } = desktop
   await openTrustedProject(desktop)
   await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
-  const dialog = page.getByRole('dialog', { name: '新建会话', exact: true })
-  await expect(dialog.locator('#session-workspace')).toBeEnabled()
-  await expect(dialog.locator('#session-workspace')).toHaveValue('shared')
-  await expect(dialog.locator('option[value="isolated"]')).toBeDisabled()
-  await expect(dialog).toContainText('尚无 Git 提交')
-  await dialog.getByRole('button', { name: '开始会话', exact: true }).click()
-  await expect(dialog).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: '开始新会话', exact: true })).toBeVisible()
+  const workspace = page.getByRole('button', { name: '选择工作区', exact: true })
+  await expect(workspace).toContainText('本地')
+  await workspace.click()
+  const choices = page.getByRole('dialog', { name: '选择工作区选项', exact: true })
+  await expect(choices.getByRole('option', { name: '本地共享目录', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
+  await expect(choices.getByRole('option', { name: '新建独立工作区', exact: true })).toBeDisabled()
+  await expect(choices).toContainText('需要 Git 仓库至少有一次提交')
+  await page.keyboard.press('Escape')
+  expect((await page.evaluate(() => window.hub.bootstrap())).sessions).toHaveLength(0)
+  await sendMessage(page, 'unborn shared workspace')
+  await expect(page.getByText('CODEX_TRANSPORT_OK 中文流式输出', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '切换代码工作区', exact: true }).click()
   await expect(page.getByRole('textbox', { name: '快速打开文件', exact: true })).toBeVisible()
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Shift+P' : 'Control+Shift+P')

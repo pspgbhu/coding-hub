@@ -232,6 +232,9 @@ export class CodexAdapter {
         ...inputImages(turn.context).map((image) => ({ type: 'image', url: image.dataUrl })),
       ],
       model: turn.context.session.model || undefined,
+      effort: turn.context.session.model
+        ? turn.context.session.reasoningOption || undefined
+        : undefined,
     })
     state.nativeTurnId = started.turn.id
     if (state.stopped)
@@ -446,11 +449,53 @@ export class CodexAdapter {
       () => {},
     )
     try {
-      const result = await rpc.request('model/list', { includeHidden: false })
-      return result.data.map((model: Message) => ({
-        id: model.id,
-        name: model.displayName ?? model.model ?? model.id,
-      }))
+      const models: Model[] = []
+      const cursors = new Set<string>()
+      let cursor: string | undefined
+      do {
+        const result = await rpc.request('model/list', {
+          includeHidden: false,
+          ...(cursor ? { cursor } : {}),
+        })
+        for (const model of result.data ?? []) {
+          const options = Array.isArray(model.supportedReasoningEfforts)
+            ? model.supportedReasoningEfforts
+                .filter((option: Message) => typeof option.reasoningEffort === 'string')
+                .map((option: Message) => ({
+                  value: option.reasoningEffort,
+                  label: option.reasoningEffort,
+                  ...(typeof option.description === 'string'
+                    ? { description: option.description }
+                    : {}),
+                }))
+            : []
+          models.push({
+            id: model.id,
+            name: model.displayName ?? model.model ?? model.id,
+            ...(typeof model.description === 'string' ? { description: model.description } : {}),
+            ...(typeof model.isDefault === 'boolean' ? { isDefault: model.isDefault } : {}),
+            ...(options.length
+              ? {
+                  reasoning: {
+                    kind: 'effort' as const,
+                    options,
+                    ...(options.some(
+                      (option: { value: string }) => option.value === model.defaultReasoningEffort,
+                    )
+                      ? { default: model.defaultReasoningEffort }
+                      : {}),
+                  },
+                }
+              : {}),
+          })
+        }
+        cursor = typeof result.nextCursor === 'string' ? result.nextCursor : undefined
+        if (cursor) {
+          if (cursors.has(cursor)) throw new Error('Codex model discovery repeated a page cursor.')
+          cursors.add(cursor)
+        }
+      } while (cursor)
+      return models
     } finally {
       rpc.close()
     }

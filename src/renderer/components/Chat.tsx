@@ -1,9 +1,8 @@
-import { memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
   ArrowUp,
-  Square,
   ChevronDown,
   ChevronRight,
   Check,
@@ -13,10 +12,7 @@ import {
   AlertCircle,
   LoaderCircle,
   MessageCircleQuestion,
-  X,
-  FileCode2,
   RotateCcw,
-  ImagePlus,
 } from 'lucide-react'
 import {
   ACTIVE_STATUSES,
@@ -30,7 +26,9 @@ import {
   type TurnInput,
 } from '../../shared/types'
 import { api } from '../lib/api'
-import { registerCloseFlush } from '../lib/close-flush'
+import Composer from './Composer'
+import ContextPreview from './ContextPreview'
+import type { ReactNode } from 'react'
 
 const Markdown = memo(function Markdown({ children }: { children: string }) {
   return (
@@ -69,64 +67,7 @@ const Markdown = memo(function Markdown({ children }: { children: string }) {
     </ReactMarkdown>
   )
 })
-function ContextPreview({ item, onRemove }: { item: ContextItem; onRemove?: () => void }) {
-  const [open, setOpen] = useState(false)
-  const id = useId()
-  const image =
-    item.kind === 'image' && /^data:image\/(?:png|jpe?g|webp);base64,/i.test(item.dataUrl ?? '')
-  return (
-    <div className="context-reference">
-      <div className="context-chip">
-        <button
-          className="context-preview-toggle"
-          aria-expanded={open}
-          aria-controls={id}
-          title={`预览引用 ${item.name}`}
-          onClick={() => setOpen((value) => !value)}
-        >
-          {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          <FileCode2 size={13} />
-          <span>
-            {item.name}
-            {item.startLine
-              ? `:${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ''}`
-              : ''}
-          </span>
-        </button>
-        {onRemove && (
-          <button
-            className="icon-button"
-            title="移除引用"
-            aria-label={`移除引用 ${item.name}`}
-            onClick={onRemove}
-          >
-            <X size={12} />
-          </button>
-        )}
-      </div>
-      {open && (
-        <div id={id} className="context-preview" role="region" aria-label={`${item.name} 引用预览`}>
-          {item.path && <small>{item.path}</small>}
-          {image ? (
-            <img
-              src={item.dataUrl}
-              alt={item.name}
-              loading="lazy"
-              decoding="async"
-              style={{ maxWidth: '100%', maxHeight: 320, objectFit: 'contain' }}
-            />
-          ) : item.kind === 'image' ? (
-            <p>图片内容无法预览，请移除后重新选择。</p>
-          ) : (
-            <pre style={{ maxHeight: 280, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
-              {item.content || '（空内容）'}
-            </pre>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
+
 function Tool({
   event,
   sessionId,
@@ -470,7 +411,7 @@ export interface ChatProps {
   events: AgentEvent[]
   loading: boolean
   provider?: ProviderInfo
-  onSend: (input: TurnInput) => Promise<void>
+  onSend: (input: TurnInput, draft: ComposerDraft) => Promise<void>
   onStop: () => void
   onError: (error: unknown) => void
   context?: ContextItem
@@ -485,6 +426,7 @@ export interface ChatProps {
   onLatest?: () => void
   onInspectTurn?: (turnId: string) => void
   focusEventId?: string
+  composerControls?: (busy: boolean) => ReactNode
 }
 export default function Chat({
   session,
@@ -506,17 +448,11 @@ export default function Chat({
   onLatest,
   onInspectTurn,
   focusEventId,
+  composerControls,
 }: ChatProps) {
-  const [draft, setDraft] = useState<ComposerDraft>({ text: '', context: [], updatedAt: 0 })
-  const [draftLoading, setDraftLoading] = useState(false)
-  const [draftError, setDraftError] = useState(false)
-  const [draftAttempt, setDraftAttempt] = useState(0)
-  const draftRef = useRef<{ id: string; draft: ComposerDraft } | undefined>(undefined)
-  const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
-  const [sending, setSending] = useState(false)
+  const [editPrompt, setEditPrompt] = useState<{ draftKey: string; text: string; nonce: number }>()
   const [copiedId, setCopiedId] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
   const following = useRef(true)
   const focusedEvent = useRef<string | undefined>(undefined)
   const pagePosition = useRef<{ height: number; top: number; prepend: boolean } | undefined>(
@@ -541,67 +477,6 @@ export default function Chat({
       ),
     [events],
   )
-  const flushDraft = async () => {
-    clearTimeout(draftTimer.current)
-    const current = draftRef.current
-    if (current) await api.saveDraft(current.id, current.draft)
-  }
-  useEffect(() => registerCloseFlush(flushDraft), [])
-  function updateDraft(next: ComposerDraft) {
-    if (!session || draftRef.current?.id !== session.id) return
-    draftRef.current = { id: session.id, draft: next }
-    setDraft(next)
-    clearTimeout(draftTimer.current)
-    draftTimer.current = setTimeout(() => void flushDraft().catch(onError), 250)
-  }
-  useEffect(() => {
-    void flushDraft().catch(onError)
-    draftRef.current = undefined
-    setDraft({ text: '', context: [], updatedAt: 0 })
-    setDraftLoading(Boolean(session))
-    setDraftError(false)
-    let stale = false
-    if (session)
-      void api
-        .getDraft(session.id)
-        .then((saved) => {
-          if (stale) return
-          draftRef.current = { id: session.id, draft: saved }
-          setDraft(saved)
-        })
-        .catch((error) => {
-          if (!stale) {
-            setDraftError(true)
-            onError(error)
-          }
-        })
-        .finally(() => {
-          if (!stale) setDraftLoading(false)
-        })
-    following.current = true
-    inputRef.current?.focus()
-    return () => {
-      stale = true
-      void flushDraft().catch(onError)
-    }
-  }, [session?.id, draftAttempt])
-  useEffect(() => {
-    const unload = () => void flushDraft().catch(onError)
-    window.addEventListener('beforeunload', unload)
-    return () => window.removeEventListener('beforeunload', unload)
-  }, [])
-  useEffect(() => {
-    if (!context || draftLoading || !session || draftRef.current?.id !== session.id) return
-    const current = draftRef.current.draft
-    if ((context.content?.length ?? 0) > 60000 || current.context.length >= 20) {
-      onError('最多添加 20 项引用，单项文本上限为 60,000 字符。请缩小引用内容。')
-      clearContext()
-      return
-    }
-    if (!current.context.some((item) => item.id === context.id))
-      updateDraft({ ...current, context: [...current.context, context], updatedAt: Date.now() })
-    clearContext()
-  }, [context, draftLoading, session?.id])
   useLayoutEffect(() => {
     const position = pagePosition.current
     const scroller = scrollRef.current
@@ -630,45 +505,7 @@ export default function Chat({
   useEffect(() => {
     if (following.current && !focusEventId)
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-  }, [events, sending, focusEventId])
-  useEffect(() => {
-    const input = inputRef.current
-    if (input) {
-      input.style.height = 'auto'
-      input.style.height = Math.min(input.scrollHeight, 190) + 'px'
-    }
-  }, [draft.text])
-  async function send() {
-    if (!draft.text.trim() || sending || running || !session || disabled || draftLoading) return
-    if (
-      draft.text.length +
-        draft.context.reduce((sum, item) => sum + (item.content?.length ?? 0), 0) >
-      95000
-    ) {
-      onError('消息与引用内容合计超过 95,000 字符。请缩短消息或选择较小的代码片段后发送。')
-      return
-    }
-    setSending(true)
-    following.current = true
-    const sentDraft = draft
-    const sentSessionId = session.id
-    try {
-      await onSend({ text: draft.text.trim(), context: draft.context })
-      const empty = { text: '', context: [], updatedAt: Date.now() }
-      if (draftRef.current?.id === sentSessionId && draftRef.current.draft === sentDraft) {
-        updateDraft(empty)
-        await api.saveDraft(sentSessionId, empty)
-      } else if (draftRef.current?.id !== sentSessionId) {
-        const persisted = await api.getDraft(sentSessionId)
-        if (persisted.updatedAt <= sentDraft.updatedAt) await api.saveDraft(sentSessionId, empty)
-      }
-    } catch (error) {
-      onError(error)
-    } finally {
-      setSending(false)
-      inputRef.current?.focus()
-    }
-  }
+  }, [events, focusEventId])
   return (
     <div className="chat">
       <div
@@ -786,8 +623,8 @@ export default function Chat({
                     <button
                       key={prompt}
                       onClick={() => {
-                        updateDraft({ ...draft, text: prompt, updatedAt: Date.now() })
-                        inputRef.current?.focus()
+                        if (session)
+                          setEditPrompt({ draftKey: session.id, text: prompt, nonce: Date.now() })
                       }}
                     >
                       <span>{prompt}</span>
@@ -959,128 +796,29 @@ export default function Chat({
           )}
         </div>
       </div>
-      <div className="composer-area">
-        {draftError && (
-          <div className="inline-warning" role="alert">
-            草稿读取失败，请重试以保留已有内容。
-            <button
-              className="button secondary small"
-              onClick={() => setDraftAttempt((attempt) => attempt + 1)}
-            >
-              重新读取草稿
-            </button>
-          </div>
-        )}
-        <div className="composer">
-          {draft.context.map((item) => (
-            <ContextPreview
-              key={item.id}
-              item={item}
-              onRemove={() =>
-                updateDraft({
-                  ...draft,
-                  context: draft.context.filter((entry) => entry.id !== item.id),
-                  updatedAt: Date.now(),
-                })
-              }
-            />
-          ))}
-          <textarea
-            aria-label="消息输入框"
-            ref={inputRef}
-            value={draft.text}
-            onChange={(event) =>
-              updateDraft({ ...draft, text: event.target.value, updatedAt: Date.now() })
-            }
-            placeholder={running ? 'Agent 正在处理，完成后继续对话…' : '输入任务…'}
-            rows={2}
-            disabled={!session || draftLoading || draftError}
-            onKeyDown={(event) => {
-              if (
-                event.key === 'Enter' &&
-                !event.shiftKey &&
-                !event.nativeEvent.isComposing &&
-                (settings?.sendKey !== 'mod-enter' || event.metaKey || event.ctrlKey)
-              ) {
-                event.preventDefault()
-                void send()
-              }
-            }}
-          />
-          <div className="composer-footer">
-            <button
-              className="icon-button"
-              title="添加图片"
-              disabled={!provider?.capabilities?.images || draftLoading || draftError || !session}
-              onClick={() => {
-                const id = session?.id
-                void api
-                  .addImages()
-                  .then((images) => {
-                    const current = draftRef.current
-                    if (!current || current.id !== id) return
-                    if (current.draft.context.length + images.length > 20) {
-                      onError('最多添加 20 项引用。请移除部分引用后再选择图片。')
-                      return
-                    }
-                    updateDraft({
-                      ...current.draft,
-                      context: [...current.draft.context, ...images],
-                      updatedAt: Date.now(),
-                    })
-                  })
-                  .catch(onError)
-              }}
-            >
-              <ImagePlus size={15} />
-            </button>
-            <div className="composer-meta">
-              <span
-                className="provider-dot"
-                style={{ background: session && PROVIDERS[session.provider].color }}
-              />
-              <span>{session && PROVIDERS[session.provider].name}</span>
-              <span className="meta-divider" />
-              <span>{session?.model || '默认模型'}</span>
-              {provider && !provider.available && <span className="text-warning">CLI 未就绪</span>}
-            </div>
-            {running ? (
-              <button
-                className="send-button stop-button"
-                title="停止执行"
-                aria-label="停止执行"
-                onClick={onStop}
-              >
-                <Square size={14} fill="currentColor" />
-              </button>
-            ) : (
-              <button
-                className="send-button"
-                title="发送消息 · Enter"
-                aria-label="发送消息"
-                disabled={!draft.text.trim() || sending || !session || disabled || draftLoading}
-                onClick={() => void send()}
-              >
-                {sending ? (
-                  <LoaderCircle size={17} className="spin" />
-                ) : (
-                  <ArrowUp size={18} strokeWidth={2.6} />
-                )}
-              </button>
-            )}
-          </div>
-        </div>
-        <div className="composer-hint">
-          <span>Agent 可以修改文件和执行命令，请留意操作授权。</span>
-          <span>
-            {draftLoading
-              ? '正在恢复草稿…'
-              : settings?.sendKey === 'mod-enter'
-                ? '⌘/Ctrl + Enter 发送'
-                : 'Enter 发送 · Shift + Enter 换行'}
-          </span>
-        </div>
-      </div>
+      {session && (
+        <Composer
+          key={session.id}
+          draftKey={session.id}
+          loadDraft={() => api.getDraft(session.id)}
+          saveDraft={(draft) => api.saveDraft(session.id, draft)}
+          onSend={async (input, draft) => {
+            following.current = true
+            await onSend(input, draft)
+          }}
+          serverClearsDraft
+          onError={onError}
+          provider={provider}
+          running={running}
+          onStop={onStop}
+          disabled={disabled}
+          context={context}
+          clearContext={clearContext}
+          settings={settings}
+          editRequest={editPrompt}
+          renderControls={(_draft, _update, busy) => composerControls?.(busy)}
+        />
+      )}
     </div>
   )
 }

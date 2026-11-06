@@ -35,6 +35,109 @@ afterEach(() => {
 })
 
 describe('Codex public app-server protocol', () => {
+  it('discovers paginated models with native reasoning options and tolerates older metadata', async () => {
+    fixtures.script = `
+      const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+      rl.on('line',line=>{const m=JSON.parse(line);
+        if(m.method==='initialize')send({id:m.id,result:{}});
+        if(m.method==='model/list'){
+          if(m.params.includeHidden!==false)process.exit(8);
+          if(!m.params.cursor)send({id:m.id,result:{data:[{id:'reasoner',displayName:'Reasoner',description:'Native model description',isDefault:true,defaultReasoningEffort:'medium',supportedReasoningEfforts:[{reasoningEffort:'medium',description:'Balanced'},{reasoningEffort:'high',description:'Thorough'}]},{id:'legacy'}],nextCursor:'page-2'}});
+          else if(m.params.cursor==='page-2')send({id:m.id,result:{data:[{id:'plain',model:'plain',isDefault:false,supportedReasoningEfforts:[]}],nextCursor:null}});
+          else process.exit(9);
+        }
+      });
+    `
+    const adapter = new CodexAdapter(() => {})
+    try {
+      expect(await adapter.models(process.execPath, '/tmp')).toEqual([
+        {
+          id: 'reasoner',
+          name: 'Reasoner',
+          description: 'Native model description',
+          isDefault: true,
+          reasoning: {
+            kind: 'effort',
+            default: 'medium',
+            options: [
+              { value: 'medium', label: 'medium', description: 'Balanced' },
+              { value: 'high', label: 'high', description: 'Thorough' },
+            ],
+          },
+        },
+        { id: 'legacy', name: 'legacy' },
+        { id: 'plain', name: 'plain', isDefault: false },
+      ])
+    } finally {
+      await adapter.close()
+    }
+  })
+  it('rejects repeated model page cursors instead of looping indefinitely', async () => {
+    fixtures.script = `
+      const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+      rl.on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')send({id:m.id,result:{}});if(m.method==='model/list')send({id:m.id,result:{data:[],nextCursor:'repeated'}})});
+    `
+    const adapter = new CodexAdapter(() => {})
+    try {
+      await expect(adapter.models(process.execPath, '/tmp')).rejects.toThrow(
+        'repeated a page cursor',
+      )
+    } finally {
+      await adapter.close()
+    }
+  })
+  it.each([
+    { name: 'CLI defaults', model: undefined, reasoningOption: undefined, nativeId: undefined },
+    {
+      name: 'new explicit selection',
+      model: 'reasoner',
+      reasoningOption: 'high',
+      nativeId: undefined,
+    },
+    {
+      name: 'resumed model default',
+      model: 'reasoner',
+      reasoningOption: 'medium',
+      nativeId: 'existing',
+    },
+  ])(
+    'sends $name through the native turn parameters',
+    async ({ model, reasoningOption, nativeId }) => {
+      fixtures.script = `
+      const expected=${JSON.stringify({ model, effort: reasoningOption })};const existing=${JSON.stringify(nativeId ?? null)};
+      const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
+      rl.on('line',line=>{const m=JSON.parse(line);
+        if(m.method==='initialize')send({id:m.id,result:{}});
+        if(m.method==='thread/start'||m.method==='thread/resume'){
+          if(m.method!==(existing?'thread/resume':'thread/start')||(existing&&m.params.threadId!==existing))process.exit(8);
+          send({id:m.id,result:{thread:{id:existing||'created'},reasoningEffort:'high'}});
+        }
+        if(m.method==='turn/start'){
+          const actual=Object.fromEntries(['model','effort'].filter(k=>Object.hasOwn(m.params,k)).map(k=>[k,m.params[k]]));
+          if(JSON.stringify(actual)!==JSON.stringify(expected))process.exit(9);
+          send({id:m.id,result:{turn:{id:'turn'}}});
+          send({method:'turn/completed',params:{threadId:existing||'created',turn:{id:'turn',status:'completed'}}});
+        }
+      });
+    `
+      const events: AgentEvent[] = []
+      const adapter = new CodexAdapter((event) => events.push(event))
+      try {
+        await adapter.send(
+          { ...context, session: { ...context.session, model, reasoningOption, nativeId } },
+          'Hello',
+          'selection',
+        )
+        await vi.waitFor(() => expect(events.some((event) => event.kind === 'done')).toBe(true))
+        expect(events.filter((event) => event.kind === 'error')).toEqual([])
+        expect(events.find((event) => event.kind === 'session')?.nativeId).toBe(
+          nativeId ?? 'created',
+        )
+      } finally {
+        await adapter.close()
+      }
+    },
+  )
   it('keeps a protocol-failed turn locked when child cleanup cannot be confirmed', async () => {
     fixtures.script = `const rl=require('readline').createInterface({input:process.stdin});const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');rl.on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')send({id:m.id,result:{}});if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'broken'}}});if(m.method==='turn/start'){send({id:m.id,result:{turn:{id:'broken-turn'}}});process.stdout.write('{invalid-json}\\n')}})`
     const events: AgentEvent[] = []

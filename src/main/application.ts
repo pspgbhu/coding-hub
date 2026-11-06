@@ -20,6 +20,7 @@ import {
   type AppHealth,
   type ContextItem,
   type Settings,
+  type Session,
   type Workspace,
   type WorkspaceIdentity,
   type TaskRun,
@@ -62,6 +63,21 @@ const inputSchema = z.object({
   text: z.string().max(100000),
   context: z.array(contextSchema).max(20),
 })
+const newSessionSelectionSchema = z.object({
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  model: z.string().max(300).optional(),
+  reasoningOption: z.string().max(300).optional(),
+})
+const newSessionDraftSchema = inputSchema.extend({
+  id,
+  updatedAt: z.number().nonnegative(),
+  ...newSessionSelectionSchema.shape,
+  workspace: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('shared') }),
+    z.object({ kind: z.literal('isolated') }),
+    z.object({ kind: z.literal('existing'), id }),
+  ]),
+})
 const settingsSchema = z.object({
   theme: z.enum(['system', 'dark', 'light']),
   cliPaths: z.object({
@@ -78,6 +94,7 @@ const settingsSchema = z.object({
   sidebarWidth: z.number().min(180).max(420).optional(),
   workspaceWidth: z.number().min(350).max(1400).optional(),
   terminalHeight: z.number().min(140).max(700).optional(),
+  newSessionDefaults: z.record(z.string().max(200), newSessionSelectionSchema).optional(),
 })
 const active = (status: string) =>
   ACTIVE_STATUSES.includes(status as (typeof ACTIVE_STATUSES)[number])
@@ -107,6 +124,10 @@ export class ApplicationServices {
   private dataGeneration = randomUUID()
   private restoring = false
   private projectOperations = 0
+  private readonly newSessionCreations = new Map<
+    string,
+    { projectId: string; promise: Promise<Session> }
+  >()
   private closing = false
   private readonly outputStore: OutputStore
   private readonly eventBatcher = new EventBatcher((event) => this.receive(event))
@@ -736,13 +757,22 @@ export class ApplicationServices {
       ...(this.healthState.code === 'BACKUP_FAILED' ? {} : { message: undefined, code: undefined }),
     })
   }
-  private async isolated(projectId: string, base?: string): Promise<Workspace> {
+  private async isolated(
+    projectId: string,
+    base?: string,
+    workspaceId: string = randomUUID(),
+  ): Promise<Workspace> {
     const project = this.store.project(projectId)
     const shared = this.workspace(projectId)
     this.trusted(shared)
+    const existing = this.store.workspaces(projectId).find((item) => item.id === workspaceId)
+    if (existing) {
+      if (existing.kind !== 'worktree' || !existing.ownedByHub)
+        throw new Error('此工作区不能用于创建独立会话。')
+      return existing
+    }
     const identity = await this.identity(shared)
     if (!identity.hasHead) throw new Error('此项目尚无 Git 提交，请使用当前目录或先创建首个提交。')
-    const workspaceId = randomUUID()
     const destination = join(this.dataDir, 'worktrees', project.id, workspaceId)
     const branch = `coding-hub/${workspaceId.slice(0, 8)}`
     const created = await this.mutate(shared, () =>
@@ -766,7 +796,14 @@ export class ApplicationServices {
       ownedByHub: true,
       createdAt: Date.now(),
     }
-    this.store.addWorkspace(workspace)
+    try {
+      this.store.addWorkspace(workspace)
+    } catch (error) {
+      await this.runtime
+        .call('workspace.removeWorktree', shared.cwd, workspace.cwd)
+        .catch((cleanupError) => this.log('workspace-create-cleanup', String(cleanupError)))
+      throw error
+    }
     this.broadcast('hub:sessions')
     return workspace
   }
@@ -977,6 +1014,7 @@ export class ApplicationServices {
           projectId: id,
           provider: z.enum(['claude', 'codex', 'opencode']),
           model: z.string().max(300).optional(),
+          reasoningOption: z.string().max(300).optional(),
           workspaceId: id.optional(),
           isolated: z.boolean().optional(),
           base: z.string().max(300).optional(),
@@ -992,6 +1030,7 @@ export class ApplicationServices {
         parsed.provider,
         parsed.model,
         workspace.id,
+        { reasoningOption: parsed.reasoningOption },
       )
       this.store.saveSettings({
         ...this.store.settings(),
@@ -1000,6 +1039,71 @@ export class ApplicationServices {
       })
       this.broadcast('hub:sessions')
       return session
+    },
+    getNewSessionDraft: (value: unknown) =>
+      newSessionDraftSchema.parse(this.store.getNewSessionDraft(id.parse(value))),
+    saveNewSessionDraft: (value: unknown, draft: unknown, generation?: unknown) => {
+      this.assertGeneration(generation)
+      const projectId = id.parse(value)
+      const parsed = newSessionDraftSchema.parse(draft)
+      if (this.store.project(projectId).removedAt)
+        throw new Error('请先恢复项目，再保存新会话草稿。')
+      if (this.newSessionCreations.has(parsed.id))
+        throw new Error('正在创建此会话，请等待完成后继续编辑。')
+      try {
+        this.store.saveNewSessionDraft(projectId, parsed)
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('[STALE_NEW_SESSION_DRAFT]'))
+          throw error
+        this.failStorage(error)
+        throw error
+      }
+    },
+    createSessionFromDraft: async (value: unknown, draftValue: unknown, generation?: unknown) => {
+      this.assertGeneration(generation)
+      this.writable()
+      const projectId = id.parse(value)
+      const draftId = id.parse(draftValue)
+      const existing = this.store.findSession(draftId)
+      if (existing) {
+        if (existing.projectId !== projectId) throw new Error('会话不属于此项目。')
+        return existing
+      }
+      const pending = this.newSessionCreations.get(draftId)
+      if (pending) {
+        if (pending.projectId !== projectId) throw new Error('草稿不属于此项目。')
+        return pending.promise
+      }
+      const draft = newSessionDraftSchema.parse(this.store.getNewSessionDraft(projectId))
+      if (draft.id !== draftId)
+        throw new Error('[STALE_NEW_SESSION_DRAFT] 新会话草稿已更换，请重新打开。')
+      this.projectOperations++
+      const promise = (async () => {
+        const workspace =
+          draft.workspace.kind === 'isolated'
+            ? await this.isolated(projectId, undefined, draft.id)
+            : this.workspace(draft.workspace.kind === 'existing' ? draft.workspace.id : projectId)
+        if (workspace.projectId !== projectId) throw new Error('工作区不属于此项目。')
+        this.trusted(workspace)
+        this.assertGeneration(generation)
+        this.writable()
+        let session: Session
+        try {
+          session = this.store.createSessionFromDraft(projectId, draftId, workspace.id)
+        } catch (error) {
+          this.failStorage(error)
+          throw error
+        }
+        this.broadcast('hub:sessions')
+        return session
+      })()
+      this.newSessionCreations.set(draftId, { projectId, promise })
+      try {
+        return await promise
+      } finally {
+        this.projectOperations--
+        this.newSessionCreations.delete(draftId)
+      }
     },
     getSession: (value: unknown, page?: unknown) =>
       this.store.view(
@@ -1031,6 +1135,7 @@ export class ApplicationServices {
           title: z.string().trim().min(1).max(200).optional(),
           archived: z.boolean().optional(),
           model: z.string().max(300).optional(),
+          reasoningOption: z.string().max(300).nullable().optional(),
           pinned: z.boolean().optional(),
           deletedAt: z.number().nullable().optional(),
           readAt: z.number().optional(),
@@ -1039,12 +1144,33 @@ export class ApplicationServices {
       const session = this.store.session(id.parse(value))
       if (
         active(session.status) &&
-        (parsed.archived || parsed.deletedAt || parsed.model !== undefined)
+        (parsed.archived ||
+          parsed.deletedAt ||
+          parsed.model !== undefined ||
+          parsed.reasoningOption !== undefined)
       )
         throw new Error('请先停止此会话的任务。')
-      const { deletedAt, ...rest } = parsed
+      if (parsed.model !== undefined || parsed.reasoningOption !== undefined) {
+        const workspace = this.workspace(session.workspaceId ?? session.projectId)
+        const identity = this.identities.get(workspace.id) ?? {
+          rootPath: workspace.cwd,
+          canonicalId: workspace.cwd,
+          hasHead: false,
+        }
+        if (
+          [...this.reservations.values(), ...this.mutations.values()].some((other) =>
+            this.overlaps(identity, other),
+          )
+        )
+          throw new Error('[WORKSPACE_BUSY] 工作区正在启动任务或执行其他操作，请稍后修改模型。')
+      }
+      const { deletedAt, reasoningOption, ...rest } = parsed
       const updated = this.store.patchSession(session.id, {
         ...rest,
+        ...(reasoningOption !== undefined ||
+        (parsed.model !== undefined && parsed.model !== session.model)
+          ? { reasoningOption: reasoningOption ?? undefined }
+          : {}),
         ...(Object.hasOwn(parsed, 'deletedAt')
           ? { deletedAt: deletedAt === null ? undefined : deletedAt }
           : {}),
@@ -1125,10 +1251,32 @@ export class ApplicationServices {
       }
       return items
     },
-    sendMessage: async (value: unknown, input: unknown) => {
+    sendMessage: async (
+      value: unknown,
+      input: unknown,
+      options?: unknown,
+      generation?: unknown,
+    ) => {
+      this.assertGeneration(generation)
       this.writable()
       if (this.cleanup) await this.cleanup
-      const session = this.store.session(id.parse(value))
+      this.assertGeneration(generation)
+      let session = this.store.session(id.parse(value))
+      const submission = z
+        .object({
+          firstMessage: z.boolean().optional(),
+          draftUpdatedAt: z.number().nonnegative().optional(),
+        })
+        .parse(options ?? {})
+      const firstMessageAccepted = () =>
+        Boolean(
+          this.store.db
+            .prepare(
+              "SELECT 1 FROM events WHERE id = ? AND session_id = ? AND json_extract(data, '$.kind') = 'user'",
+            )
+            .get(session.id, session.id),
+        )
+      if (submission.firstMessage && firstMessageAccepted()) return
       if (session.deletedAt || session.archived) throw new Error('请先恢复会话后再发送。')
       const workspace = this.workspace(session.workspaceId ?? session.projectId)
       this.trusted(workspace)
@@ -1148,6 +1296,7 @@ export class ApplicationServices {
           .join('')
       if (text.length > 100000) throw new Error('消息和引用合计超过 100,000 字符，请缩小引用。')
       const scope = await this.scope(workspace)
+      this.assertGeneration(generation)
       this.writable()
       const identity = this.identities.get(workspace.id)!
       if (
@@ -1160,6 +1309,8 @@ export class ApplicationServices {
       const turnId = randomUUID()
       try {
         await this.assertIdle(workspace)
+        session = this.store.session(session.id)
+        if (session.deletedAt || session.archived) throw new Error('请先恢复会话后再发送。')
         await this.runtime.call(
           'review.capture',
           workspace.cwd,
@@ -1169,7 +1320,7 @@ export class ApplicationServices {
           turnId,
         )
         const event: AgentEvent = {
-          id: randomUUID(),
+          id: submission.firstMessage ? session.id : randomUUID(),
           sessionId: session.id,
           turnId,
           kind: 'user',
@@ -1178,10 +1329,26 @@ export class ApplicationServices {
           timestamp: Date.now(),
         }
         try {
-          this.store.db.transaction(() => {
+          const accepted = this.store.db.transaction(() => {
+            if (submission.firstMessage && firstMessageAccepted()) return false
             this.store.append(event)
             this.store.patchSession(session.id, { status: 'starting' })
+            if (submission.draftUpdatedAt !== undefined) {
+              const draft = this.store.getDraft(session.id)
+              if (
+                draft.updatedAt === submission.draftUpdatedAt &&
+                draft.text.trim() === parsed.text.trim() &&
+                JSON.stringify(draft.context) === JSON.stringify(parsed.context)
+              )
+                this.store.saveDraft(session.id, {
+                  text: '',
+                  context: [],
+                  updatedAt: Math.max(Date.now(), draft.updatedAt + 1),
+                })
+            }
+            return true
           })()
+          if (!accepted) return
         } catch (error) {
           this.failStorage(error)
           throw error
